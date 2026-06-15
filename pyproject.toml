@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "castletool"
+version = "0.1.5"
+description = "Interactive Castle deck editor for injecting images/GIFs and MIDI into Castle blueprint JSON files."
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+
+# Standard dependencies (empty by default to match your try/except logic)
+dependencies = []
+
+[project.optional-dependencies]
+# Users can install these by running: pip install castletool[all]
+all = [
+    "Pillow>=9.0.0",
+    "mido>=1.2.10",
+    "prompt_toolkit>=3.0.0"
+]
+
+[project.scripts]
+# This allows the user to simply type 'castletool' in their terminal to run your script
+castletool = "castletool:main"
