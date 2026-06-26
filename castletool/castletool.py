@@ -376,7 +376,7 @@ def collect_midi_tracks(mid) -> list[list[tuple[float,int]]]:
         for msg in track:
             abs_tick += msg.time
             if msg.type == "note_on" and msg.velocity > 0:
-                events.append((abs_tick / tpb, msg.note))
+                events.append((abs_tick / tpb * 4, msg.note))
         if events:
             result.append(events)
     return result
