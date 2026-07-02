@@ -381,31 +381,26 @@ def collect_midi_tracks(mid) -> list[list[tuple[float,int]]]:
             result.append(events)
     return result
 
-def events_to_bars(events, beats_per_bar):
-    bars = {}
-    for beat, note in events:
-        idx = int(beat // beats_per_bar)
-        rel = round(beat - idx * beats_per_bar, 9)
-        bars.setdefault(idx, {}).setdefault(rel, []).append(note)
-    return [(idx * beats_per_bar, notes) for idx, notes in sorted(bars.items())]
-
 def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
     mid = mido.MidiFile(midi_path)
     midi_tracks = collect_midi_tracks(mid)
     patterns, castle_tracks = {}, []
     for t_idx, events in enumerate(midi_tracks):
-        seq = {}
-        for bar_beat, notes_by_beat in events_to_bars(events, beats_per_bar):
-            pid = str(uuid.uuid4())
-            notes = {beat_key(b): [{"key": n} for n in ns]
-                     for b, ns in sorted(notes_by_beat.items())}
-            patterns[pid] = {
-                "patternId": pid,
-                "name": f"t{t_idx}-b{int(bar_beat//beats_per_bar)+1}",
-                "color": make_color(), "loop": "nextBar", "loopLength": 0,
-                "notes": notes,
-            }
-            seq[bar_beat] = pid
+        # merge every note in the track into a single pattern, keyed by
+        # its absolute beat position (instead of one pattern per bar).
+        notes_by_beat = {}
+        for beat, note in events:
+            notes_by_beat.setdefault(round(beat, 9), []).append(note)
+
+        pid = str(uuid.uuid4())
+        notes = {beat_key(b): [{"key": n} for n in ns]
+                 for b, ns in sorted(notes_by_beat.items())}
+        patterns[pid] = {
+            "patternId": pid,
+            "name": f"t{t_idx}",
+            "color": make_color(), "loop": "nextBar", "loopLength": 0,
+            "notes": notes,
+        }
         castle_tracks.append({
             "instrument": {
                 "type": "sampler",
@@ -420,8 +415,7 @@ def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
                 },
             },
             "sequence": {
-                beat_key(b): {"patternId": pid, "loop": False}
-                for b, pid in sorted(seq.items())
+                beat_key(0): {"patternId": pid, "loop": False}
             },
         })
     return {
