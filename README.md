@@ -44,4 +44,4 @@ A: That means the image or MIDI file you input caused your deck to exceed castle
 
 Q: Why does it say I don't have any decks?
 
-A: You are probably running the command while in a different directory. `cd` into where your deck is (probably `~/decks`)
+A: You are probably running the command while in a different directory. `cd` into where your deck is (usually `~/decks`)
