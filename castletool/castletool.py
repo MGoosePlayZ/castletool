@@ -5,6 +5,7 @@ Streamlines injecting images/GIFs and MIDI into Castle blueprint JSON files.
 """
 
 import base64
+import bisect
 import copy
 import io
 import json
@@ -368,15 +369,79 @@ def build_drawing2(
 def beat_key(b): return f"{b:.6f}"
 def make_color(): return {"r": 0.19607, "g": 0.16862, "b": 0.15681, "a": 1.0}
 
+DEFAULT_TEMPO = 500000  # microseconds per beat == 120 BPM, mido/MIDI spec default
+
+def get_tempo_map(mid) -> list[tuple[int, int]]:
+    """
+    Scan every track for `set_tempo` meta messages and return a sorted,
+    deduped list of (abs_tick, tempo_us_per_beat) covering the whole file.
+    Tempo events can technically appear on any track, not just track 0,
+    so all tracks are scanned and merged by absolute tick.
+    """
+    events = []
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                events.append((abs_tick, msg.tempo))
+    if not events:
+        return [(0, DEFAULT_TEMPO)]
+    events.sort(key=lambda e: e[0])
+    # if multiple tempo changes land on the same tick, keep the last one
+    deduped = []
+    for tick, tempo in events:
+        if deduped and deduped[-1][0] == tick:
+            deduped[-1] = (tick, tempo)
+        else:
+            deduped.append((tick, tempo))
+    if deduped[0][0] != 0:
+        deduped.insert(0, (0, DEFAULT_TEMPO))
+    return deduped
+
+def make_tick_scaler(tempo_map: list[tuple[int, int]]):
+    """
+    Build a function mapping abs_tick -> "scaled tick", where the scaling
+    compresses/expands ticks by how much each tempo segment's speed differs
+    from the file's reference (initial) tempo. Castle plays music at a
+    single constant BPM, so a MIDI's tempo *changes* have to be baked into
+    the beat spacing itself, otherwise sections that sped up or slowed down
+    in the original file play back at the wrong relative speed in Castle.
+    A file with only one tempo (the common case) scales by exactly 1.0
+    everywhere, so this is a no-op for tempo-stable MIDIs.
+    """
+    reference_tempo = tempo_map[0][1]
+    ticks = [t for t, _ in tempo_map]
+    # cumulative scaled-tick value at the start of each tempo segment.
+    # A segment's real duration is delta_ticks * tempo (µs/beat); dividing
+    # that real duration back through reference_tempo gives how many ticks
+    # it "would have been" at the reference tempo, so faster segments
+    # (smaller µs/beat) compress and slower segments expand.
+    cum_at_start = [0.0]
+    for i in range(1, len(tempo_map)):
+        prev_tick, prev_tempo = tempo_map[i - 1]
+        cur_tick, _ = tempo_map[i]
+        delta_ticks = cur_tick - prev_tick
+        cum_at_start.append(cum_at_start[-1] + delta_ticks * (prev_tempo / reference_tempo))
+
+    def scale(abs_tick: int) -> float:
+        idx = bisect.bisect_right(ticks, abs_tick) - 1
+        idx = max(0, idx)
+        seg_tick, seg_tempo = tempo_map[idx]
+        return cum_at_start[idx] + (abs_tick - seg_tick) * (seg_tempo / reference_tempo)
+
+    return scale
+
 def collect_midi_tracks(mid) -> list[list[tuple[float,int]]]:
     tpb = mid.ticks_per_beat
+    scale = make_tick_scaler(get_tempo_map(mid))
     result = []
     for track in mid.tracks:
         events, abs_tick = [], 0
         for msg in track:
             abs_tick += msg.time
             if msg.type == "note_on" and msg.velocity > 0:
-                events.append((abs_tick / tpb * 4, msg.note))
+                events.append((scale(abs_tick) / tpb * 4, msg.note))
         if events:
             result.append(events)
     return result
