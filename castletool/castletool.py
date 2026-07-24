@@ -192,10 +192,11 @@ def find_blueprints(card: Path) -> list[Path]:
 
 def load_image_frames(path: Path, size: int):
     img = Image.open(path)
+    resample = Image.NEAREST if size > max(img.size) else Image.LANCZOS
 
     # Normal image
     if not getattr(img, "is_animated", False):
-        frame = img.convert("RGBA").resize((size, size), Image.LANCZOS)
+        frame = img.convert("RGBA").resize((size, size), resample)
         buf = io.BytesIO()
         frame.save(buf, format="PNG")
         return [buf.getvalue()], 1.0
@@ -206,7 +207,7 @@ def load_image_frames(path: Path, size: int):
 
     try:
         while True:
-            frame = img.convert("RGBA").resize((size, size), Image.LANCZOS)
+            frame = img.convert("RGBA").resize((size, size), resample)
             buf = io.BytesIO()
             frame.save(buf, format="PNG")
             frames.append(buf.getvalue())
