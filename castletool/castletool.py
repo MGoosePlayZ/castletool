@@ -220,6 +220,22 @@ def load_image_frames(path: Path, size: int):
 
     return frames, fps
 
+def probe_video_size(path: Path) -> int:
+    """Return max(width, height) of a video file via ffprobe."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=s=x:p=0", str(path)],
+        capture_output=True, text=True
+    )
+    raw = probe.stdout.strip()
+    try:
+        w, h = raw.split("x")
+        return max(int(w), int(h))
+    except Exception:
+        return 64
+
+
 def extract_mp4_frames(path: Path, size: int, every_n: int = 1) -> tuple[list[bytes], float]:
     """Extract frames from MP4 using ffmpeg. Returns (png_frames, fps)."""
     if not HAS_FFMPEG:
@@ -613,8 +629,14 @@ def main():
                     except:
                         pe("Invalid size.")
             else:
-                with Image.open(img_path) as _img:
-                    size = max(_img.size)
+                if is_video:
+                    if not HAS_FFMPEG:
+                        pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
+                        sys.exit(1)
+                    size = probe_video_size(img_path)
+                else:
+                    with Image.open(img_path) as _img:
+                        size = max(_img.size)
 
             # frame skip for animations
             if is_anim:
