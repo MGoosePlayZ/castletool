@@ -259,10 +259,13 @@ def extract_mp4_frames(path: Path, size: int, every_n: int = 1) -> tuple[list[by
 
     effective_fps = fps / every_n
 
+    src_size = probe_video_size(path)
+    scale_flags = "neighbor" if size > src_size else "bicubic"
+
     # Extract frames as PNG via pipe
     result = subprocess.run(
         ["ffmpeg", "-i", str(path),
-         "-vf", f"select='not(mod(n\\,{every_n}))',scale={size}:{size}:force_original_aspect_ratio=decrease,pad={size}:{size}:(ow-iw)/2:(oh-ih)/2",
+         "-vf", f"select='not(mod(n\\,{every_n}))',scale={size}:{size}:force_original_aspect_ratio=decrease:flags={scale_flags},pad={size}:{size}:(ow-iw)/2:(oh-ih)/2",
          "-vsync", "vfr",
          "-f", "image2pipe", "-vcodec", "png", "-"],
         capture_output=True
