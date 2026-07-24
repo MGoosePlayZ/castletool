@@ -651,9 +651,9 @@ def main():
 
             # quantize
             p()
-            if file_size > 500_000 or yn("Would you like to quantize this image? (reduces file size, usually no visible difference at ≥256 colors)", default="n"):
-                if file_size > 500_000:
-                    pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
+            if file_size > 500_000:
+                pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
+            if yn("Would you like to quantize this image? (reduces file size, usually no visible difference at ≥256 colors)", default="y" if file_size > 500_000 else "n"):
                 while True:
                     raw = ask("Select number of colors", default="256")
                     if raw.isdigit() and 1 <= int(raw) <= 256:
