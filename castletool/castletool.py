@@ -9,12 +9,15 @@ import bisect
 import copy
 import io
 import json
+import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -39,12 +42,6 @@ except ImportError:
     HAS_PT = False
 
 HAS_FZF = shutil.which("fzf") is not None
-
-try:
-    from svg_to_castle import svg_to_path_data, build_drawing2_vector
-    HAS_SVG = True
-except ImportError:
-    HAS_SVG = False
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -303,9 +300,6 @@ def quantize_frame(png_bytes: bytes, colors: int) -> bytes:
     result.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
-import base64
-import math
-
 def build_drawing2(
     frames: list[bytes],
     fps: float,
@@ -383,6 +377,433 @@ def build_drawing2(
 
         "disabled": False,
         } 
+
+# ── svg → Drawing2 (vector) ──────────────────────────────────────────────────
+# Merged from svg_to_castle.py: flattens all SVG paths to straight line
+# segments (s:1, f:false). Bezier curves are sampled at `steps` intervals.
+
+# Castle coordinate scale: SVG px → Castle units
+# fillPixelsPerUnit = 25.6 by default
+SVG_DEFAULT_PPU = 25.6
+SVG_NS = "http://www.w3.org/2000/svg"
+
+
+def _svg_lerp(a, b, t): return a + (b - a) * t
+
+def _svg_quadratic_point(p0, p1, p2, t):
+    x = (1-t)**2*p0[0] + 2*(1-t)*t*p1[0] + t**2*p2[0]
+    y = (1-t)**2*p0[1] + 2*(1-t)*t*p1[1] + t**2*p2[1]
+    return (x, y)
+
+def _svg_cubic_point(p0, p1, p2, p3, t):
+    x = (1-t)**3*p0[0] + 3*(1-t)**2*t*p1[0] + 3*(1-t)*t**2*p2[0] + t**3*p3[0]
+    y = (1-t)**3*p0[1] + 3*(1-t)**2*t*p1[1] + 3*(1-t)*t**2*p2[1] + t**3*p3[1]
+    return (x, y)
+
+
+def _svg_arc_to_lines(x1, y1, rx, ry, x_rot, large, sweep, x2, y2, steps):
+    """Convert SVG arc to polyline points."""
+    if x1 == x2 and y1 == y2:
+        return []
+    if rx == 0 or ry == 0:
+        return [(x1, y1), (x2, y2)]
+
+    phi = math.radians(x_rot)
+    cos_phi, sin_phi = math.cos(phi), math.sin(phi)
+
+    dx, dy = (x1 - x2) / 2, (y1 - y2) / 2
+    x1p =  cos_phi * dx + sin_phi * dy
+    y1p = -sin_phi * dx + cos_phi * dy
+
+    rx, ry = abs(rx), abs(ry)
+    x1p2, y1p2, rx2, ry2 = x1p**2, y1p**2, rx**2, ry**2
+    lam = x1p2/rx2 + y1p2/ry2
+    if lam > 1:
+        sq = math.sqrt(lam)
+        rx, ry = sq * rx, sq * ry
+        rx2, ry2 = rx**2, ry**2
+
+    num = max(0, rx2*ry2 - rx2*y1p2 - ry2*x1p2)
+    den = rx2*y1p2 + ry2*x1p2
+    sq = math.sqrt(num / den) if den else 0
+    if large == sweep:
+        sq = -sq
+
+    cxp =  sq * rx * y1p / ry
+    cyp = -sq * ry * x1p / rx
+
+    cx = cos_phi*cxp - sin_phi*cyp + (x1+x2)/2
+    cy = sin_phi*cxp + cos_phi*cyp + (y1+y2)/2
+
+    def angle(ux, uy, vx, vy):
+        n = math.sqrt(ux**2+uy**2) * math.sqrt(vx**2+vy**2)
+        if n == 0: return 0
+        c = max(-1, min(1, (ux*vx+uy*vy)/n))
+        a = math.acos(c)
+        if ux*vy - uy*vx < 0: a = -a
+        return a
+
+    theta1 = angle(1, 0, (x1p-cxp)/rx, (y1p-cyp)/ry)
+    dtheta = angle((x1p-cxp)/rx, (y1p-cyp)/ry, (-x1p-cxp)/rx, (-y1p-cyp)/ry)
+
+    if not sweep and dtheta > 0: dtheta -= 2*math.pi
+    if sweep and dtheta < 0: dtheta += 2*math.pi
+
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        theta = theta1 + t * dtheta
+        x = cos_phi*rx*math.cos(theta) - sin_phi*ry*math.sin(theta) + cx
+        y = sin_phi*rx*math.cos(theta) + cos_phi*ry*math.sin(theta) + cy
+        pts.append((x, y))
+    return pts
+
+
+def _svg_parse_numbers(s: str) -> list[float]:
+    return [float(x) for x in re.findall(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', s)]
+
+
+def _svg_path_to_polylines(d: str, steps: int = 16) -> list[list[tuple]]:
+    """
+    Parse SVG path 'd' attribute, return list of polylines.
+    Each polyline is a list of (x, y) tuples.
+    Beziers are sampled at 'steps' intervals.
+    """
+    tokens = re.findall(r'[MmZzLlHhVvCcSsQqTtAa]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', d)
+    cmd = None
+    pos = (0.0, 0.0)
+    start = (0.0, 0.0)
+    last_ctrl = None
+    polylines = []
+    current = []
+
+    def flush():
+        nonlocal current
+        if len(current) >= 2:
+            polylines.append(current)
+        current = []
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if re.match(r'[MmZzLlHhVvCcSsQqTtAa]', t):
+            cmd = t
+            i += 1
+            if cmd in ('Z', 'z'):
+                if current and current[-1] != start:
+                    current.append(start)
+                flush()
+                pos = start
+                cmd = None
+            continue
+
+        if cmd in ('Z', 'z'):
+            if current and current[-1] != start:
+                current.append(start)
+            flush()
+            pos = start
+            cmd = None
+            continue
+
+        nparams = {
+            'M':2,'m':2,'L':2,'l':2,'H':1,'h':1,'V':1,'v':1,
+            'C':6,'c':6,'S':4,'s':4,'Q':4,'q':4,'T':2,'t':2,
+            'A':7,'a':7,
+        }.get(cmd, 0)
+
+        if nparams == 0:
+            i += 1
+            continue
+
+        args = []
+        while len(args) < nparams and i < len(tokens):
+            tok = tokens[i]
+            if re.match(r'[MmZzLlHhVvCcSsQqTtAa]', tok):
+                break
+            args.append(float(tok))
+            i += 1
+
+        if len(args) < nparams:
+            continue
+
+        rel = cmd.islower()
+        base = pos if rel else (0.0, 0.0)
+
+        if cmd in ('M', 'm'):
+            flush()
+            nx, ny = base[0]+args[0], base[1]+args[1]
+            pos = (nx, ny)
+            start = pos
+            current = [pos]
+            last_ctrl = None
+            cmd = 'l' if rel else 'L'
+
+        elif cmd in ('L', 'l'):
+            nx, ny = base[0]+args[0], base[1]+args[1]
+            pos = (nx, ny)
+            current.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('H', 'h'):
+            nx = (pos[0] if rel else 0) + args[0]
+            pos = (nx, pos[1])
+            current.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('V', 'v'):
+            ny = (pos[1] if rel else 0) + args[0]
+            pos = (pos[0], ny)
+            current.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('C', 'c'):
+            p1 = (base[0]+args[0], base[1]+args[1])
+            p2 = (base[0]+args[2], base[1]+args[3])
+            p3 = (base[0]+args[4], base[1]+args[5])
+            for s in range(1, steps+1):
+                current.append(_svg_cubic_point(pos, p1, p2, p3, s/steps))
+            last_ctrl = p2
+            pos = p3
+
+        elif cmd in ('S', 's'):
+            p1 = (2*pos[0]-last_ctrl[0], 2*pos[1]-last_ctrl[1]) if last_ctrl else pos
+            p2 = (base[0]+args[0], base[1]+args[1])
+            p3 = (base[0]+args[2], base[1]+args[3])
+            for s in range(1, steps+1):
+                current.append(_svg_cubic_point(pos, p1, p2, p3, s/steps))
+            last_ctrl = p2
+            pos = p3
+
+        elif cmd in ('Q', 'q'):
+            p1 = (base[0]+args[0], base[1]+args[1])
+            p2 = (base[0]+args[2], base[1]+args[3])
+            for s in range(1, steps+1):
+                current.append(_svg_quadratic_point(pos, p1, p2, s/steps))
+            last_ctrl = p1
+            pos = p2
+
+        elif cmd in ('T', 't'):
+            p1 = (2*pos[0]-last_ctrl[0], 2*pos[1]-last_ctrl[1]) if last_ctrl else pos
+            p2 = (base[0]+args[0], base[1]+args[1])
+            for s in range(1, steps+1):
+                current.append(_svg_quadratic_point(pos, p1, p2, s/steps))
+            last_ctrl = p1
+            pos = p2
+
+        elif cmd in ('A', 'a'):
+            rx,ry,xr = args[0],args[1],args[2]
+            large,sweep = int(args[3]),int(args[4])
+            ex,ey = base[0]+args[5], base[1]+args[6]
+            pts = _svg_arc_to_lines(pos[0],pos[1],rx,ry,xr,large,sweep,ex,ey,steps)
+            if pts:
+                current.extend(pts[1:])
+            last_ctrl = None
+            pos = (ex, ey)
+
+    flush()
+    return polylines
+
+
+SVG_COLORS = {
+    "black":(0,0,0),"white":(1,1,1),"red":(1,0,0),"green":(0,0.502,0),
+    "blue":(0,0,1),"yellow":(1,1,0),"cyan":(0,1,1),"magenta":(1,0,1),
+    "gray":(0.502,0.502,0.502),"grey":(0.502,0.502,0.502),
+    "none":None,
+}
+
+def parse_svg_color(s: str, opacity: float = 1.0):
+    if not s or s == "none": return None
+    s = s.strip().lower()
+    if s in SVG_COLORS:
+        c = SVG_COLORS[s]
+        return [*c, opacity] if c else None
+    if s.startswith("#"):
+        h = s[1:]
+        if len(h) == 3: h = h[0]*2+h[1]*2+h[2]*2
+        r,g,b = int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+        return [r, g, b, opacity]
+    m = re.match(r'rgb\((\d+),\s*(\d+),\s*(\d+)\)', s)
+    if m:
+        return [int(m.group(i))/255 for i in (1,2,3)] + [opacity]
+    return [0, 0, 0, opacity]
+
+
+def svg_to_path_data(svg_path, steps: int = 16, scale: float = 1.0,
+                     ppu: float = SVG_DEFAULT_PPU, color=None):
+    """
+    Parse an SVG file and return a Castle pathDataList and framesBounds.
+    scale: multiplier applied to Castle units (1.0 = default)
+    ppu: pixels per unit (default 25.6)
+    color: override color [r,g,b,a], None = use SVG colors
+    """
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+
+    def tag(el): return el.tag.split('}')[-1] if '}' in el.tag else el.tag
+
+    vb = root.get("viewBox")
+    if vb:
+        parts = _svg_parse_numbers(vb)
+        vb_x, vb_y, vb_w, vb_h = parts
+    else:
+        vb_x, vb_y = 0, 0
+        vb_w = float(root.get("width", 100))
+        vb_h = float(root.get("height", 100))
+
+    # SVG Y is flipped vs Castle Y
+    def to_castle_raw(x, y):
+        return (x / ppu * scale, -(y / ppu) * scale)
+
+    _cx_offset = [0.0]
+    _cy_offset = [0.0]
+
+    def to_castle(x, y):
+        rx, ry = to_castle_raw(x, y)
+        return (rx - _cx_offset[0], ry - _cy_offset[0])
+
+    path_data = []
+    default_color = color or [0, 0, 0, 1]
+    all_xs, all_ys = [], []
+
+    def get_color(el):
+        if color: return color
+        stroke = el.get("stroke") or el.get("style", "")
+        m = re.search(r'stroke\s*:\s*([^;]+)', stroke)
+        stroke_val = m.group(1).strip() if m else (el.get("stroke") or "black")
+        op_m = re.search(r'stroke-opacity\s*:\s*([^;]+)', el.get("style",""))
+        opacity = float(op_m.group(1)) if op_m else float(el.get("stroke-opacity", 1))
+        c = parse_svg_color(stroke_val, opacity)
+        return c if c else default_color
+
+    def process_element(el):
+        t = tag(el)
+        c = get_color(el)
+
+        polylines = []
+
+        if t == "path":
+            d = el.get("d", "")
+            polylines = _svg_path_to_polylines(d, steps)
+
+        elif t == "line":
+            x1,y1 = float(el.get("x1",0)), float(el.get("y1",0))
+            x2,y2 = float(el.get("x2",0)), float(el.get("y2",0))
+            polylines = [[(x1,y1),(x2,y2)]]
+
+        elif t == "polyline" or t == "polygon":
+            pts_raw = _svg_parse_numbers(el.get("points",""))
+            pts = [(pts_raw[i],pts_raw[i+1]) for i in range(0,len(pts_raw)-1,2)]
+            if t == "polygon" and pts: pts.append(pts[0])
+            polylines = [pts]
+
+        elif t == "rect":
+            x,y = float(el.get("x",0)), float(el.get("y",0))
+            w,h = float(el.get("width",0)), float(el.get("height",0))
+            polylines = [[(x,y),(x+w,y),(x+w,y+h),(x,y+h),(x,y)]]
+
+        elif t == "circle":
+            cx2,cy2,r = float(el.get("cx",0)),float(el.get("cy",0)),float(el.get("r",1))
+            pts = [(cx2+r*math.cos(2*math.pi*i/steps),
+                    cy2+r*math.sin(2*math.pi*i/steps)) for i in range(steps+1)]
+            polylines = [pts]
+
+        elif t == "ellipse":
+            cx2,cy2 = float(el.get("cx",0)),float(el.get("cy",0))
+            rx2,ry2 = float(el.get("rx",1)),float(el.get("ry",1))
+            pts = [(cx2+rx2*math.cos(2*math.pi*i/steps),
+                    cy2+ry2*math.sin(2*math.pi*i/steps)) for i in range(steps+1)]
+            polylines = [pts]
+
+        for poly in polylines:
+            if len(poly) < 2: continue
+            castle_pts = [to_castle(x, y) for x, y in poly]
+            for j in range(len(castle_pts)-1):
+                x1,y1 = castle_pts[j]
+                x2,y2 = castle_pts[j+1]
+                path_data.append({
+                    "p": [round(x1,5), round(y1,5), round(x2,5), round(y2,5)],
+                    "s": 1,
+                    "f": False,
+                    "c": [round(v,5) for v in c],
+                })
+                all_xs.extend([x1, x2])
+                all_ys.extend([y1, y2])
+
+        for child in el:
+            process_element(child)
+
+    process_element(root)
+
+    if not all_xs:
+        return path_data, {"minX":-5,"maxX":5,"minY":-5,"maxY":5}, {"minX":-32,"maxX":32,"minY":-32,"maxY":32}
+
+    mid_x = (min(all_xs) + max(all_xs)) / 2
+    mid_y = (min(all_ys) + max(all_ys)) / 2
+    for seg in path_data:
+        seg["p"][0] = round(seg["p"][0] - mid_x, 5)
+        seg["p"][1] = round(seg["p"][1] - mid_y, 5)
+        seg["p"][2] = round(seg["p"][2] - mid_x, 5)
+        seg["p"][3] = round(seg["p"][3] - mid_y, 5)
+    all_xs = [x - mid_x for x in all_xs]
+    all_ys = [y - mid_y for y in all_ys]
+
+    bounds = {
+        "minX": round(min(all_xs), 5),
+        "maxX": round(max(all_xs), 5),
+        "minY": round(min(all_ys), 5),
+        "maxY": round(max(all_ys), 5),
+    }
+
+    fill_bounds = {
+        "minX": round(min(all_xs) * ppu / scale),
+        "maxX": round(max(all_xs) * ppu / scale),
+        "minY": round(-max(all_ys) * ppu / scale),
+        "maxY": round(-min(all_ys) * ppu / scale),
+    }
+
+    return path_data, bounds, fill_bounds
+
+
+def build_drawing2_vector(path_data, bounds, fill_bounds,
+                           scale=10, ppu=SVG_DEFAULT_PPU) -> dict:
+    frame = {
+        "isLinked": False,
+        "pathDataList": path_data,
+        "fillImageBounds": fill_bounds,
+        "avatarX": 0, "avatarY": 0, "avatarRadius": 5,
+    }
+    return {
+        "initialFrame": 1, "currentFrame": 1,
+        "framesPerSecond": 4,
+        "playMode": "still",
+        "loopStartFrame": -1, "loopEndFrame": -1,
+        "opacity": 1,
+        "hash": str(abs(hash(str(path_data))))[:19],
+        "playing": False, "loop": False,
+        "drawData": {
+            "color": [1,1,1,1], "lineColor": [0,0,0,1],
+            "gridSize": 0.71428, "scale": scale, "version": 3,
+            "fillPixelsPerUnit": ppu,
+            "numTotalLayers": 1,
+            "framesBounds": [bounds],
+            "colors": [], "selectedFrame": 1,
+            "layers": [{
+                "title": "Layer 1", "id": "layer1",
+                "isVisible": True, "isBitmap": False, "isAvatar": False,
+                "frames": [frame],
+            }],
+        },
+        "physicsBodyData": {
+            "shapes": [{
+                "p1": {"x": 5, "y": 5}, "p2": {"x": -5, "y": -5},
+                "p3": {"x": 0, "y": 0}, "radius": 0, "x": 0, "y": 0,
+                "type": "rectangle",
+            }],
+            "scale": scale, "version": 2, "zeroShapesInV1": False,
+        },
+        "disabled": False,
+    }
+
 
 # ── midi → Music ─────────────────────────────────────────────────────────────
 
@@ -667,9 +1088,6 @@ def main():
 
         p()
         if is_vector:
-            if not HAS_SVG:
-                pe("svg_to_castle.py not found — place it in the same folder as castle_tool.py")
-                sys.exit(1)
             pb(f"Loading SVG: {img_path.name}")
             svg_scale = 1.0
             if yn("Would you like to scale the SVG output?", default="n"):
