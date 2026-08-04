@@ -888,7 +888,7 @@ def collect_midi_tracks(mid) -> list[list[tuple[float,int]]]:
     return result
 
 def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
-    mid = mido.MidiFile(midi_path)
+    mid = mido.MidiFile(midi_path, clip=True)
     midi_tracks = collect_midi_tracks(mid)
     patterns, castle_tracks = {}, []
     for t_idx, events in enumerate(midi_tracks):
