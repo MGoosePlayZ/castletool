@@ -1171,8 +1171,21 @@ def main():
     # ── save ──
     p()
     if yn("Would you like to save this deck now?"):
-        result = subprocess.run(["castle", "save-deck", str(deck)],
-                                capture_output=True, text=True)
+        castle_argv = ["castle", "save-deck", str(deck)]
+        if os.name == "nt":
+            # On Windows, CreateProcess (used when shell=False) only tries
+            # appending .exe to a bare command name — it doesn't check
+            # PATHEXT the way a real shell does. Most CLI tools (including
+            # Castle's) install as a .cmd shim, so a bare "castle" call
+            # fails with WinError 2 even though it's on PATH and works fine
+            # when typed into a terminal. Routing through cmd.exe /c gives
+            # it the same PATHEXT-aware resolution the shell uses.
+            castle_argv = ["cmd", "/c", *castle_argv]
+        try:
+            result = subprocess.run(castle_argv, capture_output=True, text=True)
+        except FileNotFoundError:
+            pe("Could not find the 'castle' CLI. Is it installed and on your PATH?")
+            sys.exit(1)
         combined = (result.stdout + result.stderr).lower()
         if result.returncode == 0:
             ps("Saved!")
