@@ -33,15 +33,6 @@ try:
 except ImportError:
     HAS_MIDO = False
 
-try:
-    from prompt_toolkit import prompt as pt_prompt
-    from prompt_toolkit.completion import PathCompleter
-    from prompt_toolkit.styles import Style
-    HAS_PT = True
-except ImportError:
-    HAS_PT = False
-
-HAS_FZF = shutil.which("fzf") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -68,8 +59,14 @@ def ask(prompt, default=None):
     return val if val else (default or "")
 
 def yn(prompt, default="y"):
+    hint = "Y/n" if default == "y" else "y/N"
     while True:
-        ans = ask(prompt + " (y/n)", default=default).lower()
+        try:
+            ans = input(f"{BOLD}{prompt} ({hint}){RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            p(); sys.exit(0)
+        if ans == "":
+            return default == "y"
         if ans in ("y", "n"):
             return ans == "y"
         p("Please enter y or n.")
@@ -86,60 +83,14 @@ def choose(prompt, options):
             return options[int(raw) - 1]
         p("Invalid choice.")
 
-def fzf_pick_file(start_dir: Path) -> str | None:
-    """Open fzf to fuzzy-find a file under start_dir. Returns path string or None."""
-    try:
-        # find all files under start_dir, pipe into fzf
-        find = subprocess.run(
-            ["find", str(start_dir), "-type", "f"],
-            capture_output=True, text=True
-        )
-        fzf = subprocess.run(
-            ["fzf", "--prompt", "Select file> ", "--height", "40%",
-             "--layout", "reverse", "--border"],
-            input=find.stdout,
-            capture_output=True, text=True
-        )
-        result = fzf.stdout.strip()
-        return result if result else None
-    except Exception:
-        return None
-
-
 def ask_path(prompt, default=None, search_dir: Path | None = None):
-    """
-    File path input. Priority:
-      1. fzf fuzzy picker (if fzf installed)
-      2. prompt_toolkit tab-complete (if installed)
-      3. plain input fallback
-    """
+    """Plain file path input."""
     suffix = f" [{default}]" if default is not None else ""
     pb(prompt + suffix)
-
-    if HAS_FZF:
-        start = search_dir or Path.cwd()
-        ps(f"Opening fzf in {start} — type to fuzzy search, Enter to select, Esc to type manually.")
-        picked = fzf_pick_file(start)
-        if picked:
-            ps(f"Selected: {picked}")
-            return picked
-        pw("fzf cancelled, falling back to manual input.")
-
-    if HAS_PT:
-        try:
-            from prompt_toolkit.formatted_text import FormattedText
-            val = pt_prompt(
-                FormattedText([("bold", "Path: ")]),
-                completer=PathCompleter(expanduser=True),
-                complete_while_typing=False,
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
-            p(); sys.exit(0)
-    else:
-        try:
-            val = input(f"{BOLD}Path: {RESET}").strip()
-        except (EOFError, KeyboardInterrupt):
-            p(); sys.exit(0)
+    try:
+        val = input(f"{BOLD}Path: {RESET}").strip()
+    except (EOFError, KeyboardInterrupt):
+        p(); sys.exit(0)
     return val if val else (default or "")
 
 
@@ -154,17 +105,45 @@ def resolve_path(raw: str) -> Path:
 def is_termux() -> bool:
     return "com.termux" in str(Path.home()) or os.environ.get("TERMUX_VERSION") is not None
 
-def check_storage_setup() -> bool:
-    return (Path.home() / "storage").exists()
+# ── dependency auto-install ──────────────────────────────────────────────────
 
-def setup_termux_storage():
-    p()
-    pw("It looks like you do not have storage set up.")
-    if yn("Would you like to set it up now?"):
-        pb("Running 'termux-setup-storage'...")
-        subprocess.run(["termux-setup-storage"])
-        ps("Setup complete! You may need to restart the script.")
-        sys.exit(0)
+def ensure_dependencies():
+    """Best-effort auto-install of missing dependencies."""
+    global HAS_PIL, HAS_MIDO, HAS_FFMPEG, Image, mido
+
+    pip_missing = []
+    if not HAS_PIL:  pip_missing.append("Pillow")
+    if not HAS_MIDO: pip_missing.append("mido")
+
+    if pip_missing:
+        pb(f"Installing {', '.join(pip_missing)}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *pip_missing])
+
+    if not HAS_FFMPEG:
+        pb("Installing ffmpeg...")
+        if is_termux():
+            subprocess.run(["pkg", "install", "-y", "ffmpeg"])
+        elif shutil.which("apt-get"):
+            subprocess.run(["sudo", "apt-get", "install", "-y", "ffmpeg"])
+        elif shutil.which("brew"):
+            subprocess.run(["brew", "install", "ffmpeg"])
+        else:
+            pw("Could not auto-install ffmpeg. Please install it manually.")
+
+    if pip_missing or not HAS_FFMPEG:
+        try:
+            from PIL import Image as _Image
+            Image = _Image
+            HAS_PIL = True
+        except ImportError:
+            HAS_PIL = False
+        try:
+            import mido as _mido
+            mido = _mido
+            HAS_MIDO = True
+        except ImportError:
+            HAS_MIDO = False
+        HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── deck / card / blueprint discovery ────────────────────────────────────────
 
@@ -187,24 +166,23 @@ def find_blueprints(card: Path) -> list[Path]:
 
 # ── image/gif → Drawing2 ─────────────────────────────────────────────────────
 
-def load_image_frames(path: Path, size: int):
+def load_image_frames(path: Path, width: int, height: int):
     img = Image.open(path)
-    resample = Image.NEAREST if size > max(img.size) else Image.LANCZOS
 
     # Normal image
     if not getattr(img, "is_animated", False):
-        frame = img.convert("RGBA").resize((size, size), resample)
+        frame = img.convert("RGBA").resize((width, height), Image.NEAREST)
         buf = io.BytesIO()
         frame.save(buf, format="PNG")
         return [buf.getvalue()], 1.0
 
-    # Animated GIF
+    # Animated GIF/WEBP
     frames = []
     durations = []
 
     try:
         while True:
-            frame = img.convert("RGBA").resize((size, size), resample)
+            frame = img.convert("RGBA").resize((width, height), Image.NEAREST)
             buf = io.BytesIO()
             frame.save(buf, format="PNG")
             frames.append(buf.getvalue())
@@ -218,8 +196,8 @@ def load_image_frames(path: Path, size: int):
 
     return frames, fps
 
-def probe_video_size(path: Path) -> int:
-    """Return max(width, height) of a video file via ffprobe."""
+def probe_video_dimensions(path: Path) -> tuple[int, int]:
+    """Return (width, height) of a video file via ffprobe."""
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height",
@@ -229,12 +207,12 @@ def probe_video_size(path: Path) -> int:
     raw = probe.stdout.strip()
     try:
         w, h = raw.split("x")
-        return max(int(w), int(h))
+        return int(w), int(h)
     except Exception:
-        return 64
+        return 64, 64
 
 
-def extract_mp4_frames(path: Path, size: int, every_n: int = 1) -> tuple[list[bytes], float]:
+def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1) -> tuple[list[bytes], float]:
     """Extract frames from MP4 using ffmpeg. Returns (png_frames, fps)."""
     if not HAS_FFMPEG:
         pe("ffmpeg not found. Install with: pkg install ffmpeg")
@@ -256,13 +234,12 @@ def extract_mp4_frames(path: Path, size: int, every_n: int = 1) -> tuple[list[by
 
     effective_fps = fps / every_n
 
-    src_size = probe_video_size(path)
-    scale_flags = "neighbor" if size > src_size else "bicubic"
-
-    # Extract frames as PNG via pipe
+    # Extract frames as PNG via pipe. width/height already share the source's
+    # aspect ratio (scaled), so a plain nearest-neighbor scale is exact — no
+    # padding/cropping needed.
     result = subprocess.run(
         ["ffmpeg", "-i", str(path),
-         "-vf", f"select='not(mod(n\\,{every_n}))',scale={size}:{size}:force_original_aspect_ratio=decrease:flags={scale_flags},pad={size}:{size}:(ow-iw)/2:(oh-ih)/2",
+         "-vf", f"select='not(mod(n\\,{every_n}))',scale={width}:{height}:flags=neighbor",
          "-vsync", "vfr",
          "-f", "image2pipe", "-vcodec", "png", "-"],
         capture_output=True
@@ -303,18 +280,19 @@ def quantize_frame(png_bytes: bytes, colors: int) -> bytes:
 def build_drawing2(
     frames: list[bytes],
     fps: float,
-    size: int,
+    width: int,
+    height: int,
     play_mode: str = "loop"
 ) -> dict:
     # Empirical scale formula
-    scale = max(1, round(size / 20))
+    scale = max(1, round(max(width, height) / 20))
 
-    half = size / 2
+    half_w, half_h = width / 2, height / 2
     bounds = {
-        "minX": -half,
-        "maxX": half,
-        "minY": -half,
-        "maxY": half,
+        "minX": -half_w,
+        "maxX": half_w,
+        "minY": -half_h,
+        "maxY": half_h,
 }
 
     castle_frames = [{
@@ -362,8 +340,8 @@ def build_drawing2(
 
         "physicsBodyData": {
             "shapes": [{
-                "p1": {"x": half / scale, "y": half / scale},
-                "p2": {"x": -half / scale, "y": -half / scale},
+                "p1": {"x": half_w / scale, "y": half_h / scale},
+                "p2": {"x": -half_w / scale, "y": -half_h / scale},
                 "p3": {"x": 0, "y": 0},
                 "radius": 0,
                 "x": 0,
@@ -933,46 +911,26 @@ def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
 
 def main():
     p()
-    pb("═══════════════════════════════════")
-    pb("       Castle Blueprint Tool       ")
-    pb("═══════════════════════════════════")
+    pb("═══════════════")
+    pb("   Castletool   ")
+    pb("═══════════════")
     p()
 
-    # ── check deps ──
-    missing = []
-    if not HAS_PIL:   missing.append("Pillow        (pip install Pillow)")
-    if not HAS_MIDO:  missing.append("mido          (pip install mido)")
-    if not HAS_PT:    missing.append("prompt_toolkit (pip install prompt_toolkit)  — enables tab-complete for file paths")
-    if not HAS_FZF:
-        print(f"  {DIM}tip: install fzf for fuzzy file finding   (pkg install fzf){RESET}")
-    if not HAS_FFMPEG:
-        print(f"  {DIM}tip: install ffmpeg for MP4/video support  (pkg install ffmpeg){RESET}")
-    if missing:
-        pw("Missing optional dependencies (only needed for relevant features):")
-        for m in missing: print(f"   • {m}")
-        p()
-
-    # ── android warning ──
-    termux = is_termux()
-    if termux:
-        pw("Android/Termux detected. Use ~/storage/... paths for files.")
-        if not check_storage_setup():
-            setup_termux_storage()
-        p()
+    ensure_dependencies()
+    p()
 
     # ── select deck ──
     home = Path.cwd()
     decks = find_decks(home)
     if not decks:
-        pe("No Castle decks found in the current directory.")
-        pe("Run 'castle get-deck <id> <folder>' first.")
+        pe("No decks were found. Are you in the right directory?")
         sys.exit(1)
 
     deck_names = [d.name for d in decks]
     pb(f"Detected decks: {', '.join(deck_names)}")
     if len(decks) == 1:
         deck = decks[0]
-        ps(f"Only one deck ({deck.name}), auto-selecting.")
+        ps(f"Auto selecting {deck.name}")
     else:
         chosen = choose("Select the deck you would like to modify:", deck_names)
         deck = home / chosen
@@ -986,7 +944,7 @@ def main():
     card_names = [c.name for c in cards]
     if len(cards) == 1:
         card = cards[0]
-        ps(f"Only one card ({card.name}), auto-selecting.")
+        ps(f"Auto selecting {card.name}")
     else:
         chosen = choose("Select the card you would like to edit:", card_names)
         card = deck / "cards" / chosen
@@ -1000,7 +958,7 @@ def main():
     bp_names = [b.name for b in blueprints]
     if len(blueprints) == 1:
         bp_path = blueprints[0]
-        ps(f"Only one blueprint ({bp_path.name}), auto-selecting.")
+        ps(f"Auto selecting {bp_path.name}")
     else:
         chosen = choose("Select the blueprint you would like to edit:", bp_names)
         bp_path = card / "scene" / "blueprints" / chosen
@@ -1027,41 +985,35 @@ def main():
             pe(f"File not found: {img_path}")
 
         ext = img_path.suffix.lower()
-        is_anim = ext in (".gif", ".mp4", ".mov", ".webm", ".avi")
+        is_anim = ext in (".gif", ".webp", ".mp4", ".mov", ".webm", ".avi")
         is_video = ext in (".mp4", ".mov", ".webm", ".avi")
         is_vector = ext in (".svg",)
         file_size = img_path.stat().st_size
 
+        # native size + scale
         p()
+        width, every, quantize = None, 1, 0
         if not is_vector:
-            pw("Make sure this file is formatted correctly. You can verify by importing it in the Castle app.")
-            pw("If it's corrupt and you ignore this, the card may become corrupted.")
-            if not yn("Continue?"):
-                sys.exit(0)
-
-        # size
-        p()
-        resize = (not is_vector) and yn("Would you like to resize this image?", default="n")
-        size, every, quantize = None, 1, 0
-        if not is_vector:
-            if resize:
-                while True:
-                    raw = ask("Enter size (e.g. 64x64 or just 64)", default="64x64")
-                    raw = raw.strip().lower().replace("x", " ").split()
-                    try:
-                        size = int(raw[0])
-                        break
-                    except:
-                        pe("Invalid size.")
+            if is_video:
+                if not HAS_FFMPEG:
+                    pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
+                    sys.exit(1)
+                native_w, native_h = probe_video_dimensions(img_path)
             else:
-                if is_video:
-                    if not HAS_FFMPEG:
-                        pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
-                        sys.exit(1)
-                    size = probe_video_size(img_path)
-                else:
-                    with Image.open(img_path) as _img:
-                        size = max(_img.size)
+                with Image.open(img_path) as _img:
+                    native_w, native_h = _img.size
+
+            raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)", default="1")
+            try:
+                img_scale = float(raw)
+                if img_scale <= 0:
+                    raise ValueError
+            except ValueError:
+                pw("Invalid scale, using 1.")
+                img_scale = 1.0
+
+            width = max(1, round(native_w * img_scale))
+            height = max(1, round(native_h * img_scale))
 
             # frame skip for animations
             if is_anim:
@@ -1078,7 +1030,7 @@ def main():
             p()
             if file_size > 500_000:
                 pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
-            if yn("Would you like to quantize this image? (reduces file size, usually no visible difference at ≥256 colors)", default="y" if file_size > 500_000 else "n"):
+            if yn("Would you like to quantize this image? (reduces file size)", default="y" if file_size > 500_000 else "n"):
                 while True:
                     raw = ask("Select number of colors", default="256")
                     if raw.isdigit() and 1 <= int(raw) <= 256:
@@ -1116,9 +1068,9 @@ def main():
                 if not HAS_FFMPEG:
                     pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
                     sys.exit(1)
-                frames, fps = extract_mp4_frames(img_path, size, every_n=every)
+                frames, fps = extract_mp4_frames(img_path, width, height, every_n=every)
             else:
-                frames, fps = load_image_frames(img_path, size)
+                frames, fps = load_image_frames(img_path, width, height)
                 if every > 1:
                     frames = frames[::every]
                     fps = fps / every
@@ -1128,8 +1080,8 @@ def main():
                 frames = [quantize_frame(f, quantize) for f in frames]
 
             play_mode = "loop" if is_anim else "still"
-            drawing2 = build_drawing2(frames, fps, size)
-            ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {size}×{size}px")
+            drawing2 = build_drawing2(frames, fps, width, height, play_mode)
+            ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px")
 
     # ── midi? ──
     music = None
@@ -1164,16 +1116,8 @@ def main():
         pw("Nothing to do. Exiting.")
         sys.exit(0)
 
-    # ── confirm overwrite ──
-    p()
-    what = []
-    if drawing2: what.append("image/animation (Drawing2)")
-    if music:    what.append("music (Music)")
-    pw(f"This will overwrite {' and '.join(what)} in:\n   {bp_path}")
-    if not yn("Are you sure you want to modify this blueprint?"):
-        sys.exit(0)
-
     # ── inject ──
+    p()
     if drawing2:
         actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
     if music:
@@ -1181,17 +1125,19 @@ def main():
 
     with open(bp_path, "w", encoding="utf-8") as f:
         json.dump(actor, f, indent=2)
-    ps(f"Blueprint written to {bp_path}")
 
     # ── save ──
     p()
     if yn("Would you like to save this deck now?"):
         result = subprocess.run(["castle", "save-deck", str(deck)],
                                 capture_output=True, text=True)
+        combined = (result.stdout + result.stderr).lower()
         if result.returncode == 0:
             ps("Saved!")
             for line in result.stdout.strip().splitlines():
                 print(f"   {line}")
+        elif "memory access out of bounds" in combined:
+            pe("Your file is too large!")
         else:
             pe("Save failed:")
             print(result.stdout)
