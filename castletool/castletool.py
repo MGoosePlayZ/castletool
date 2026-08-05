@@ -16,9 +16,13 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+CURRENT_VERSION = "0.3.0"
+PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
 try:
@@ -104,6 +108,43 @@ def resolve_path(raw: str) -> Path:
 
 def is_termux() -> bool:
     return "com.termux" in str(Path.home()) or os.environ.get("TERMUX_VERSION") is not None
+
+# ── update check ─────────────────────────────────────────────────────────────
+
+def _version_tuple(v: str) -> tuple:
+    parts = []
+    for x in v.split("."):
+        num = "".join(ch for ch in x if ch.isdigit())
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+def get_installed_version() -> str:
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version("castletool")
+        except PackageNotFoundError:
+            return CURRENT_VERSION
+    except ImportError:
+        return CURRENT_VERSION
+
+def check_for_update():
+    """Best-effort check against PyPI. Never blocks or errors on failure."""
+    current = get_installed_version()
+    try:
+        with urllib.request.urlopen(PYPI_URL, timeout=3) as resp:
+            latest = json.loads(resp.read())["info"]["version"]
+    except Exception:
+        return
+
+    if _version_tuple(latest) > _version_tuple(current):
+        pw(f"A newer version is available: {latest} (you have {current})")
+        if yn("Install it now?"):
+            subprocess.run([sys.executable, "-m", "pip", "install",
+                             "--quiet", "--upgrade", "castletool"])
+            ps("Updated! Please restart Castletool.")
+            sys.exit(0)
+        p()
 
 # ── dependency auto-install ──────────────────────────────────────────────────
 
@@ -916,6 +957,7 @@ def main():
     pb("═══════════════")
     p()
 
+    check_for_update()
     ensure_dependencies()
     p()
 
