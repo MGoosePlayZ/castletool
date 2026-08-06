@@ -1087,6 +1087,10 @@ def do_add_midi(bp_path: Path, actor: dict):
 
 CASTLE_API_URL = "https://api.castle.xyz/graphql"
 
+def _env_flag(name: str) -> bool:
+    """True if an env var is set to a truthy value (unset/'0'/'false'/'' = off)."""
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
 def find_castle_token() -> str | None:
     """Look for a Castle CLI login token in the usual config locations."""
     candidates = []
@@ -1400,7 +1404,8 @@ def main():
             options.append("Add image")
         if HAS_MIDO:
             options.append("Add MIDI")
-        options.append("Upload HTML")
+        if _env_flag("CASTLETOOL_HTML"):
+            options.append("Upload HTML")
         options.append("Upload Deck")
         options.append("Exit Tool")
 
