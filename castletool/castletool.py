@@ -21,7 +21,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-CURRENT_VERSION = "0.3.0"
+CURRENT_VERSION = "0.3.2"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
