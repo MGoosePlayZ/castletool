@@ -21,7 +21,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-CURRENT_VERSION = "0.3.1"
+CURRENT_VERSION = "0.3.0"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -950,6 +950,169 @@ def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
 
 # ── main flow ─────────────────────────────────────────────────────────────────
 
+def do_add_image(bp_path: Path, actor: dict):
+    while True:
+        raw = ask_path("Enter the file path for your image")
+        img_path = resolve_path(raw)
+        if img_path.exists():
+            break
+        pe(f"File not found: {img_path}")
+
+    ext = img_path.suffix.lower()
+    is_anim = ext in (".gif", ".webp", ".mp4", ".mov", ".webm", ".avi")
+    is_video = ext in (".mp4", ".mov", ".webm", ".avi")
+    is_vector = ext in (".svg",)
+    file_size = img_path.stat().st_size
+
+    # native size + scale
+    p()
+    width, height, every, quantize = None, None, 1, 0
+    if not is_vector:
+        if is_video:
+            if not HAS_FFMPEG:
+                pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
+                return
+            native_w, native_h = probe_video_dimensions(img_path)
+        else:
+            with Image.open(img_path) as _img:
+                native_w, native_h = _img.size
+
+        raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)", default="1")
+        try:
+            img_scale = float(raw)
+            if img_scale <= 0:
+                raise ValueError
+        except ValueError:
+            pw("Invalid scale, using 1.")
+            img_scale = 1.0
+
+        width = max(1, round(native_w * img_scale))
+        height = max(1, round(native_h * img_scale))
+
+        # frame skip for animations
+        if is_anim:
+            p()
+            if yn("Would you like to skip frames? (reduces file size for long GIFs)", default="n"):
+                while True:
+                    raw = ask("Keep every Nth frame (e.g. 2 = half frames, 4 = quarter)", default="2")
+                    if raw.isdigit() and int(raw) >= 1:
+                        every = int(raw)
+                        break
+                    pe("Enter a positive integer.")
+
+        # quantize
+        p()
+        if file_size > 500_000:
+            pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
+        if yn("Would you like to quantize this image? (reduces file size)", default="y" if file_size > 500_000 else "n"):
+            while True:
+                raw = ask("Select number of colors", default="256")
+                if raw.isdigit() and 1 <= int(raw) <= 256:
+                    quantize = int(raw)
+                    break
+                pe("Enter a number between 1 and 256.")
+
+    p()
+    if is_vector:
+        pb(f"Loading SVG: {img_path.name}")
+        svg_scale = 1.0
+        if yn("Would you like to scale the SVG output?", default="n"):
+            while True:
+                raw = ask("Enter scale multiplier (e.g. 2.0 = twice as large)", default="1.0")
+                try:
+                    svg_scale = float(raw)
+                    break
+                except ValueError:
+                    pe("Enter a number like 1.0 or 0.5")
+        steps = 16
+        if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
+            while True:
+                raw = ask("Steps per curve segment", default="16")
+                if raw.isdigit() and int(raw) >= 2:
+                    steps = int(raw)
+                    break
+                pe("Enter a number ≥ 2")
+        path_data, bounds, fill_bounds = svg_to_path_data(
+            img_path, steps=steps, scale=svg_scale)
+        drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
+        ps(f"SVG ready: {len(path_data)} line segments")
+    else:
+        pb(f"Loading {'video' if is_video else 'image'}: {img_path.name}")
+        if is_video:
+            if not HAS_FFMPEG:
+                pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
+                return
+            frames, fps = extract_mp4_frames(img_path, width, height, every_n=every)
+        else:
+            frames, fps = load_image_frames(img_path, width, height)
+            if every > 1:
+                frames = frames[::every]
+                fps = fps / every
+
+        if quantize:
+            pb(f"Quantizing {len(frames)} frame(s) to {quantize} colors...")
+            frames = [quantize_frame(f, quantize) for f in frames]
+
+        play_mode = "loop" if is_anim else "still"
+        drawing2 = build_drawing2(frames, fps, width, height, play_mode)
+        ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px")
+
+    actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+    with open(bp_path, "w", encoding="utf-8") as f:
+        json.dump(actor, f, indent=2)
+    ps("Image added.")
+
+
+def do_add_midi(bp_path: Path, actor: dict):
+    while True:
+        raw = ask_path("Enter your MIDI file path")
+        midi_path = resolve_path(raw)
+        if midi_path.exists():
+            break
+        pe(f"File not found: {midi_path}")
+
+    p()
+    pb(f"Loading MIDI: {midi_path.name}")
+    music = build_music(midi_path)
+    pat_count = len(music["song"]["patterns"])
+    trk_count = len(music["song"]["tracks"])
+    ps(f"MIDI ready: {pat_count} patterns, {trk_count} tracks")
+
+    actor["actorBlueprint"]["components"]["Music"] = music
+    with open(bp_path, "w", encoding="utf-8") as f:
+        json.dump(actor, f, indent=2)
+    ps("MIDI added.")
+
+
+def do_upload_deck(deck: Path):
+    castle_argv = ["castle", "save-deck", str(deck)]
+    if os.name == "nt":
+        # On Windows, CreateProcess (used when shell=False) only tries
+        # appending .exe to a bare command name — it doesn't check
+        # PATHEXT the way a real shell does. Most CLI tools (including
+        # Castle's) install as a .cmd shim, so a bare "castle" call
+        # fails with WinError 2 even though it's on PATH and works fine
+        # when typed into a terminal. Routing through cmd.exe /c gives
+        # it the same PATHEXT-aware resolution the shell uses.
+        castle_argv = ["cmd", "/c", *castle_argv]
+    try:
+        result = subprocess.run(castle_argv, capture_output=True, text=True)
+    except FileNotFoundError:
+        pe("Could not find the 'castle' CLI. Is it installed and on your PATH?")
+        return
+    combined = (result.stdout + result.stderr).lower()
+    if result.returncode == 0:
+        ps("Saved!")
+        for line in result.stdout.strip().splitlines():
+            print(f"   {line}")
+    elif "memory access out of bounds" in combined:
+        pe("Your file is too large!")
+    else:
+        pe("Save failed:")
+        print(result.stdout)
+        print(result.stderr)
+
+
 def main():
     p()
     pb("═══════════════")
@@ -992,7 +1155,7 @@ def main():
         card = deck / "cards" / chosen
     p()
 
-    # ── select blueprint ──
+    # ── select blueprint (actor) ──
     blueprints = find_blueprints(card)
     if not blueprints:
         pe(f"No blueprints found in {card}.")
@@ -1002,201 +1165,33 @@ def main():
         bp_path = blueprints[0]
         ps(f"Auto selecting {bp_path.name}")
     else:
-        chosen = choose("Select the blueprint you would like to edit:", bp_names)
+        chosen = choose("Select the actor you want to edit:", bp_names)
         bp_path = card / "scene" / "blueprints" / chosen
     p()
 
-    # ── load blueprint ──
     with open(bp_path, "r", encoding="utf-8") as f:
         actor = json.load(f)
 
-    # ── image/gif? ──
-    drawing2 = None
-    if not HAS_PIL:
-        pw("Pillow not installed, skipping image/GIF option.")
-        do_image = False
-    else:
-        do_image = yn("Would you like to add an image or animation?")
+    # ── action menu ──
+    while True:
+        options = []
+        if HAS_PIL:
+            options.append("Add image")
+        if HAS_MIDO:
+            options.append("Add MIDI")
+        options.append("Upload Deck")
+        options.append("Exit Tool")
 
-    if do_image:
-        while True:
-            raw = ask_path("Enter the file path for your image")
-            img_path = resolve_path(raw)
-            if img_path.exists():
-                break
-            pe(f"File not found: {img_path}")
+        action = choose("Select the action you want to perform:", options)
 
-        ext = img_path.suffix.lower()
-        is_anim = ext in (".gif", ".webp", ".mp4", ".mov", ".webm", ".avi")
-        is_video = ext in (".mp4", ".mov", ".webm", ".avi")
-        is_vector = ext in (".svg",)
-        file_size = img_path.stat().st_size
-
-        # native size + scale
-        p()
-        width, every, quantize = None, 1, 0
-        if not is_vector:
-            if is_video:
-                if not HAS_FFMPEG:
-                    pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
-                    sys.exit(1)
-                native_w, native_h = probe_video_dimensions(img_path)
-            else:
-                with Image.open(img_path) as _img:
-                    native_w, native_h = _img.size
-
-            raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)", default="1")
-            try:
-                img_scale = float(raw)
-                if img_scale <= 0:
-                    raise ValueError
-            except ValueError:
-                pw("Invalid scale, using 1.")
-                img_scale = 1.0
-
-            width = max(1, round(native_w * img_scale))
-            height = max(1, round(native_h * img_scale))
-
-            # frame skip for animations
-            if is_anim:
-                p()
-                if yn("Would you like to skip frames? (reduces file size for long GIFs)", default="n"):
-                    while True:
-                        raw = ask("Keep every Nth frame (e.g. 2 = half frames, 4 = quarter)", default="2")
-                        if raw.isdigit() and int(raw) >= 1:
-                            every = int(raw)
-                            break
-                        pe("Enter a positive integer.")
-
-            # quantize
-            p()
-            if file_size > 500_000:
-                pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
-            if yn("Would you like to quantize this image? (reduces file size)", default="y" if file_size > 500_000 else "n"):
-                while True:
-                    raw = ask("Select number of colors", default="256")
-                    if raw.isdigit() and 1 <= int(raw) <= 256:
-                        quantize = int(raw)
-                        break
-                    pe("Enter a number between 1 and 256.")
-
-        p()
-        if is_vector:
-            pb(f"Loading SVG: {img_path.name}")
-            svg_scale = 1.0
-            if yn("Would you like to scale the SVG output?", default="n"):
-                while True:
-                    raw = ask("Enter scale multiplier (e.g. 2.0 = twice as large)", default="1.0")
-                    try:
-                        svg_scale = float(raw)
-                        break
-                    except ValueError:
-                        pe("Enter a number like 1.0 or 0.5")
-            steps = 16
-            if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
-                while True:
-                    raw = ask("Steps per curve segment", default="16")
-                    if raw.isdigit() and int(raw) >= 2:
-                        steps = int(raw)
-                        break
-                    pe("Enter a number ≥ 2")
-            path_data, bounds, fill_bounds = svg_to_path_data(
-                img_path, steps=steps, scale=svg_scale)
-            drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
-            ps(f"SVG ready: {len(path_data)} line segments")
-        else:
-            pb(f"Loading {'video' if is_video else 'image'}: {img_path.name}")
-            if is_video:
-                if not HAS_FFMPEG:
-                    pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
-                    sys.exit(1)
-                frames, fps = extract_mp4_frames(img_path, width, height, every_n=every)
-            else:
-                frames, fps = load_image_frames(img_path, width, height)
-                if every > 1:
-                    frames = frames[::every]
-                    fps = fps / every
-
-            if quantize:
-                pb(f"Quantizing {len(frames)} frame(s) to {quantize} colors...")
-                frames = [quantize_frame(f, quantize) for f in frames]
-
-            play_mode = "loop" if is_anim else "still"
-            drawing2 = build_drawing2(frames, fps, width, height, play_mode)
-            ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px")
-
-    # ── midi? ──
-    music = None
-    if not HAS_MIDO:
-        pw("mido not installed, skipping MIDI option.")
-        do_midi = False
-    else:
-        p()
-        do_midi = yn("Would you like to add a MIDI file?")
-
-    if do_midi:
-        while True:
-            raw = ask_path("Enter your MIDI file path")
-            midi_path = resolve_path(raw)
-            if midi_path.exists():
-                break
-            pe(f"File not found: {midi_path}")
-
-        p()
-        pb(f"Loading MIDI: {midi_path.name}")
-        mid = mido.MidiFile(midi_path)
-        midi_track_count = sum(
-            1 for t in mid.tracks
-            if any(m.type == "note_on" and m.velocity > 0 for m in t)
-        )
-        music = build_music(midi_path)
-        pat_count = len(music["song"]["patterns"])
-        trk_count = len(music["song"]["tracks"])
-        ps(f"MIDI ready: {pat_count} patterns, {trk_count} tracks")
-
-    if drawing2 is None and music is None:
-        pw("Nothing to do. Exiting.")
-        sys.exit(0)
-
-    # ── inject ──
-    p()
-    if drawing2:
-        actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
-    if music:
-        actor["actorBlueprint"]["components"]["Music"] = music
-
-    with open(bp_path, "w", encoding="utf-8") as f:
-        json.dump(actor, f, indent=2)
-
-    # ── save ──
-    p()
-    if yn("Would you like to save this deck now?"):
-        castle_argv = ["castle", "save-deck", str(deck)]
-        if os.name == "nt":
-            # On Windows, CreateProcess (used when shell=False) only tries
-            # appending .exe to a bare command name — it doesn't check
-            # PATHEXT the way a real shell does. Most CLI tools (including
-            # Castle's) install as a .cmd shim, so a bare "castle" call
-            # fails with WinError 2 even though it's on PATH and works fine
-            # when typed into a terminal. Routing through cmd.exe /c gives
-            # it the same PATHEXT-aware resolution the shell uses.
-            castle_argv = ["cmd", "/c", *castle_argv]
-        try:
-            result = subprocess.run(castle_argv, capture_output=True, text=True)
-        except FileNotFoundError:
-            pe("Could not find the 'castle' CLI. Is it installed and on your PATH?")
-            sys.exit(1)
-        combined = (result.stdout + result.stderr).lower()
-        if result.returncode == 0:
-            ps("Saved!")
-            for line in result.stdout.strip().splitlines():
-                print(f"   {line}")
-        elif "memory access out of bounds" in combined:
-            pe("Your file is too large!")
-        else:
-            pe("Save failed:")
-            print(result.stdout)
-            print(result.stderr)
+        if action == "Add image":
+            do_add_image(bp_path, actor)
+        elif action == "Add MIDI":
+            do_add_midi(bp_path, actor)
+        elif action == "Upload Deck":
+            do_upload_deck(deck)
+        elif action == "Exit Tool":
+            break
     p()
 
 
