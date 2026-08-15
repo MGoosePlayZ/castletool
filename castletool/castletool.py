@@ -1494,6 +1494,10 @@ def do_upload_deck(deck: Path):
 
 
 def main():
+    if "--version" in sys.argv[1:] or "-v" in sys.argv[1:]:
+        print(f"castletool {get_installed_version()}")
+        return
+
     p()
     pb("═══════════════")
     pb("   Castletool   ")
