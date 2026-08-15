@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 
 CURRENT_VERSION = "0.3.4"
@@ -205,6 +206,50 @@ def find_blueprints(card: Path) -> list[Path]:
     if not bp_dir.exists():
         return []
     return sorted([f for f in bp_dir.glob("*.json")])
+
+# ── card.json helpers ────────────────────────────────────────────────────────
+
+def load_card_json(card: Path) -> dict:
+    with open(card / "card.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_card_json(card: Path, data: dict):
+    with open(card / "card.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def hex_to_rgba(hex_str: str) -> dict:
+    """Convert a '#rrggbb' string to Castle's 0-1 float RGBA dict."""
+    hex_str = hex_str.strip().lstrip("#")
+    r = int(hex_str[0:2], 16) / 255
+    g = int(hex_str[2:4], 16) / 255
+    b = int(hex_str[4:6], 16) / 255
+    return {"r": round(r, 5), "g": round(g, 5), "b": round(b, 5), "a": 1}
+
+def do_edit_background_color(card: Path):
+    card_data = load_card_json(card)
+    current = card_data.get("backgroundColor", "#000000")
+    p()
+    pb(f"Current background color: {current}")
+    while True:
+        raw = ask("Enter new background color as hex", default=current).strip()
+        if not raw.startswith("#"):
+            raw = "#" + raw
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", raw):
+            break
+        pe("Enter a hex color like #09101a.")
+
+    card_data["backgroundColor"] = raw
+    card_data.setdefault("sceneProperties", {})["backgroundColor"] = hex_to_rgba(raw)
+    save_card_json(card, card_data)
+    ps(f"Background color set to {raw}.")
+
+def set_card_tempo(card: Path, bpm: float):
+    """Write the given BPM into card.json's sceneProperties.clock.tempo."""
+    card_data = load_card_json(card)
+    scene_props = card_data.setdefault("sceneProperties", {})
+    clock = scene_props.setdefault("clock", {"beatsPerBar": 4, "stepsPerBeat": 4})
+    clock["tempo"] = round(bpm, 2)
+    save_card_json(card, card_data)
 
 # ── image/gif → Drawing2 ─────────────────────────────────────────────────────
 
@@ -893,30 +938,94 @@ def make_tick_scaler(tempo_map: list[tuple[int, int]]):
 
     return scale
 
-def collect_midi_tracks(mid) -> list[list[tuple[float,int]]]:
+def collect_midi_tracks(mid) -> list[dict]:
+    """
+    Returns one entry per non-empty MIDI track:
+    {"events": [(beat, note), ...], "program": int, "is_drum": bool}
+
+    Since a Castle track only has one instrument, each MIDI track is
+    reduced to a single representative (channel, program) pair: whichever
+    combination its note_on events use most. Channel 10 (index 9) is
+    GM's reserved percussion channel regardless of its program number.
+    """
     tpb = mid.ticks_per_beat
     scale = make_tick_scaler(get_tempo_map(mid))
     result = []
     for track in mid.tracks:
         events, abs_tick = [], 0
+        programs = {}       # channel -> most recently seen program
+        usage = Counter()   # (channel, program) -> note_on count
         for msg in track:
             abs_tick += msg.time
-            if msg.type == "note_on" and msg.velocity > 0:
+            if msg.type == "program_change":
+                programs[msg.channel] = msg.program
+            elif msg.type == "note_on" and msg.velocity > 0:
                 events.append((scale(abs_tick) / tpb * 4, msg.note))
-        if events:
-            result.append(events)
+                channel = msg.channel
+                usage[(channel, programs.get(channel, 0))] += 1
+        if not events:
+            continue
+        (channel, program), _ = usage.most_common(1)[0]
+        result.append({
+            "events": events,
+            "program": program,
+            "is_drum": channel == 9,
+        })
     return result
 
-def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
-    mid = mido.MidiFile(midi_path, clip=True)
+def get_bpm(mid) -> float:
+    """BPM implied by the MIDI file's initial (reference) tempo."""
+    tempo_us = get_tempo_map(mid)[0][1]
+    return 60_000_000 / tempo_us
+
+# GM instrument families, in program-number order (0-indexed, inclusive
+# upper bound), each mapped to one of Castle's 4 tone waveforms plus an
+# attack/release approximating that family's envelope. Castle only offers
+# square/sawtooth/sine/noise, so this groups all 128 GM programs into
+# their 16 official families rather than mapping note-for-note.
+GM_FAMILIES = [
+    (7,   "sine",     0.0,  0.35),  # Piano
+    (15,  "sine",     0.0,  0.2),   # Chromatic Percussion
+    (23,  "square",   0.0,  0.1),   # Organ
+    (31,  "sawtooth", 0.0,  0.3),   # Guitar
+    (39,  "square",   0.0,  0.3),   # Bass
+    (47,  "sawtooth", 0.08, 0.45),  # Strings
+    (55,  "sawtooth", 0.1,  0.45),  # Ensemble
+    (63,  "square",   0.02, 0.25),  # Brass
+    (71,  "square",   0.02, 0.2),   # Reed
+    (79,  "sine",     0.03, 0.2),   # Pipe
+    (87,  "sawtooth", 0.0,  0.15),  # Synth Lead
+    (95,  "sine",     0.3,  0.6),   # Synth Pad
+    (103, "sine",     0.15, 0.4),   # Synth Effects
+    (111, "sawtooth", 0.0,  0.3),   # Ethnic
+    (119, "noise",    0.0,  0.1),   # Percussive
+    (127, "noise",    0.0,  0.2),   # Sound Effects
+]
+
+def gm_program_to_tone(program: int, is_drum: bool) -> tuple[str, float, float]:
+    """Map a GM program (+ drum-channel flag) to (waveform, attack, release)."""
+    if is_drum:
+        return "noise", 0.0, 0.12
+    program = max(0, min(127, program))
+    for upper, waveform, attack, release in GM_FAMILIES:
+        if program <= upper:
+            return waveform, attack, release
+    return "sawtooth", 0.0, 0.4  # unreachable, GM_FAMILIES covers 0-127
+
+def build_music(mid, beats_per_bar: int = 4) -> dict:
     midi_tracks = collect_midi_tracks(mid)
     patterns, castle_tracks = {}, []
-    for t_idx, events in enumerate(midi_tracks):
+    for t_idx, track in enumerate(midi_tracks):
+        waveform, attack, release = gm_program_to_tone(track["program"], track["is_drum"])
+
         # merge every note in the track into a single pattern, keyed by
         # its absolute beat position (instead of one pattern per bar).
         notes_by_beat = {}
-        for beat, note in events:
-            notes_by_beat.setdefault(round(beat, 9), []).append(note)
+        for beat, note in track["events"]:
+            # "key" already sits at the same octave the MIDI file uses
+            # (raw note number), so bump it one octave higher per spec.
+            octave_note = min(127, note + 12)
+            notes_by_beat.setdefault(round(beat, 9), []).append(octave_note)
 
         pid = str(uuid.uuid4())
         notes = {beat_key(b): [{"key": n} for n in ns]
@@ -936,8 +1045,8 @@ def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
                     "playbackRate": {"value": 1}, "amplitude": {"value": 1},
                     "pan": {"value": 0}, "recordingUrl": "", "uploadUrl": "",
                     "category": "random", "seed": 1337, "mutationSeed": 0,
-                    "mutationAmount": 5, "midiNote": 48, "waveform": "sawtooth",
-                    "attack": 0, "release": 0.4, "wait": False,
+                    "mutationAmount": 5, "midiNote": 48, "waveform": waveform,
+                    "attack": attack, "release": release, "wait": False,
                 },
             },
             "sequence": {
@@ -951,7 +1060,42 @@ def build_music(midi_path: Path, beats_per_bar: int = 4) -> dict:
 
 # ── main flow ─────────────────────────────────────────────────────────────────
 
-def do_add_image(bp_path: Path, actor: dict):
+# The CLI-scaffolded placeholder script Castle generates for a brand-new
+# actor. If a blueprint still has exactly this (untouched) when an image
+# is added to it, the placeholder is deleted since it's no longer needed.
+AUTO_GENERATED_SCRIPT = """function onCreate()
+  print("ready")
+end
+
+function onDraw()
+  castle.draw.setColor(0.25, 0.9, 0.62, 1)
+  castle.draw.circle("fill", 0, 0, 0.28)
+
+  castle.draw.setLineWidth(0.035)
+  castle.draw.setColor(1, 1, 1, 0.45)
+  castle.draw.rectangle("line", -0.42, -0.42, 0.84, 0.84)
+end"""
+
+def maybe_delete_placeholder_script(card: Path, bp_path: Path):
+    """
+    If the blueprint's matching script (<card>/scripts/<blueprint-name>.lua)
+    is exactly the CLI's auto-generated placeholder, clear its contents,
+    since an image was just added to that actor and it needs no default
+    script. The file itself is kept (rather than deleted) since Castle
+    re-creates it with the placeholder code if it's missing.
+    """
+    script_path = card / "scripts" / f"{bp_path.stem}.lua"
+    if not script_path.exists():
+        return
+    try:
+        content = script_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if content.replace("\r\n", "\n").rstrip("\n") == AUTO_GENERATED_SCRIPT.rstrip("\n"):
+        script_path.write_text("", encoding="utf-8")
+        ps(f"Cleared placeholder script: {script_path.name}")
+
+def do_add_image(bp_path: Path, actor: dict, card: Path):
     while True:
         raw = ask_path("Enter the file path for your image")
         img_path = resolve_path(raw)
@@ -1063,8 +1207,10 @@ def do_add_image(bp_path: Path, actor: dict):
         json.dump(actor, f, indent=2)
     ps("Image added.")
 
+    maybe_delete_placeholder_script(card, bp_path)
 
-def do_add_midi(bp_path: Path, actor: dict):
+
+def do_add_midi(bp_path: Path, actor: dict, card: Path):
     while True:
         raw = ask_path("Enter your MIDI file path")
         midi_path = resolve_path(raw)
@@ -1074,7 +1220,8 @@ def do_add_midi(bp_path: Path, actor: dict):
 
     p()
     pb(f"Loading MIDI: {midi_path.name}")
-    music = build_music(midi_path)
+    mid = mido.MidiFile(midi_path, clip=True)
+    music = build_music(mid)
     pat_count = len(music["song"]["patterns"])
     trk_count = len(music["song"]["tracks"])
     ps(f"MIDI ready: {pat_count} patterns, {trk_count} tracks")
@@ -1082,6 +1229,14 @@ def do_add_midi(bp_path: Path, actor: dict):
     actor["actorBlueprint"]["components"]["Music"] = music
     with open(bp_path, "w", encoding="utf-8") as f:
         json.dump(actor, f, indent=2)
+
+    bpm = get_bpm(mid)
+    try:
+        set_card_tempo(card, bpm)
+        ps(f"Card tempo set to {bpm:.2f} BPM.")
+    except FileNotFoundError:
+        pw(f"Could not find card.json in {card} — tempo was not updated.")
+
     ps("MIDI added.")
 
 
@@ -1404,6 +1559,7 @@ def main():
             options.append("Add image")
         if HAS_MIDO:
             options.append("Add MIDI")
+        options.append("Edit Background Color")
         if _env_flag("CASTLETOOL_HTML"):
             options.append("Upload HTML")
         options.append("Upload Deck")
@@ -1412,9 +1568,11 @@ def main():
         action = choose("Select the action you want to perform:", options)
 
         if action == "Add image":
-            do_add_image(bp_path, actor)
+            do_add_image(bp_path, actor, card)
         elif action == "Add MIDI":
-            do_add_midi(bp_path, actor)
+            do_add_midi(bp_path, actor, card)
+        elif action == "Edit Background Color":
+            do_edit_background_color(card)
         elif action == "Upload HTML":
             do_upload_html(deck, card)
         elif action == "Upload Deck":
