@@ -130,20 +130,52 @@ def get_installed_version() -> str:
     except ImportError:
         return CURRENT_VERSION
 
-def check_for_update():
+def _wants_prereleases() -> bool:
+    """CLI flag (--prerelease / --pre) or env var (CASTLETOOL_PRERELEASE)."""
+    if any(a in ("--prerelease", "--pre") for a in sys.argv[1:]):
+        return True
+    return _env_flag("CASTLETOOL_PRERELEASE")
+
+def _latest_version_from_pypi(data: dict, include_prereleases: bool) -> str:
+    """info.version is PyPI's "latest stable" pointer and always skips
+    pre-releases, so to consider them we have to look at the releases
+    dict ourselves."""
+    if not include_prereleases:
+        return data["info"]["version"]
+
+    releases = data.get("releases", {})
+    candidates = [v for v, files in releases.items() if files]
+    if not candidates:
+        return data["info"]["version"]
+
+    try:
+        from packaging.version import parse
+        candidates.sort(key=parse)
+    except ImportError:
+        candidates.sort(key=_version_tuple)
+    return candidates[-1]
+
+def check_for_update(include_prereleases: bool | None = None):
     """Best-effort check against PyPI. Never blocks or errors on failure."""
+    if include_prereleases is None:
+        include_prereleases = _wants_prereleases()
+
     current = get_installed_version()
     try:
         with urllib.request.urlopen(PYPI_URL, timeout=3) as resp:
-            latest = json.loads(resp.read())["info"]["version"]
+            data = json.loads(resp.read())
+        latest = _latest_version_from_pypi(data, include_prereleases)
     except Exception:
         return
 
     if _version_tuple(latest) > _version_tuple(current):
         pw(f"A newer version is available: {latest} (you have {current})")
         if yn("Install it now?"):
-            subprocess.run([sys.executable, "-m", "pip", "install",
-                             "--quiet", "--upgrade", "castletool"])
+            pip_argv = [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"]
+            if include_prereleases:
+                pip_argv.append("--pre")
+            pip_argv.append("castletool")
+            subprocess.run(pip_argv)
             ps("Updated! Please restart Castletool.")
             sys.exit(0)
         p()
