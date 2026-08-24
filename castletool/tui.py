@@ -9,7 +9,7 @@ out the plain-terminal I/O primitives that module.castletool uses
 (`p`, `pb`, `pw`, `pe`, `ps`, `ask`, `yn`, `choose`, `ask_path`) for
 equivalents backed by Textual widgets, then drives the exact same
 `do_add_image` / `do_add_midi` / `do_edit_background_color` /
-`do_upload_deck` / `do_upload_html` functions that the classic CLI uses.
+`do_upload_deck` functions that the classic CLI uses.
 
 Everything runs in a background thread (see `CastletoolApp.run_flow`) since
 that logic is written as ordinary blocking, synchronous code. Prompts are
@@ -21,11 +21,7 @@ without ever blocking the UI's event loop.
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
@@ -41,36 +37,6 @@ except ImportError:
     raise SystemExit(1)
 
 from . import castletool as ct
-
-STATE_FILE = Path.home() / ".castletool_tui_state.json"
-
-UPDATE_MESSAGE = """PLEASE READ!
-
-Hey, thanks for using castletool! You recently updated, and I want to let you know how things are changing.
-
-We are moving to textual! Many users have requested that we have a UI instead of purely terminal, so we are making the move now.
-
-From now on, you can click or tap things to choose what you want to do, and no longer have to type numbers.
-
-As always, you can report an issue on my github or in my discord, links are below.
-https://discord.gg/S86ZYzTXWw
-https://github.com/MGoosePlayZ/castletool/issues
-
-Thanks, MGoosePlayZ"""
-
-
-def _load_last_version() -> str | None:
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8")).get("version")
-    except Exception:
-        return None
-
-
-def _save_last_version(version: str) -> None:
-    try:
-        STATE_FILE.write_text(json.dumps({"version": version}), encoding="utf-8")
-    except Exception:
-        pass
 
 
 # ── tappable widgets ─────────────────────────────────────────────────────────
@@ -341,50 +307,6 @@ class CastletoolApp(App):
         self._clear_prompt()
         event.set()
 
-    # ---- update-notice help screen -------------------------------------
-
-    def _do_suspend_and_edit(self, editor: str, tmp_path: str) -> bool:
-        try:
-            with self.suspend():
-                subprocess.run([editor, tmp_path])
-            return True
-        except Exception:
-            return False
-
-    def _show_update_message(self) -> None:
-        # Suspending the TUI to hand off to an external editor is flaky on
-        # Termux's terminal driver (same reason fzf/prompt_toolkit got
-        # dropped from the classic CLI) -- just print it there instead.
-        editor = None if ct.is_termux() else (shutil.which("micro") or shutil.which("nano"))
-        opened = False
-        tmp_path = None
-        if editor:
-            try:
-                with tempfile.NamedTemporaryFile(
-                    "w", suffix=".txt", delete=False, encoding="utf-8"
-                ) as tmp:
-                    tmp.write(UPDATE_MESSAGE)
-                    tmp_path = tmp.name
-                opened = self.call_from_thread(self._do_suspend_and_edit, editor, tmp_path)
-            finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-        if not opened:
-            self.io.p()
-            for line in UPDATE_MESSAGE.splitlines():
-                self.io.p(line)
-            self.io.p()
-
-    def _maybe_show_update_message(self) -> None:
-        installed = ct.get_installed_version()
-        last_seen = _load_last_version()
-        if last_seen is not None and last_seen != installed:
-            self._show_update_message()
-        _save_last_version(installed)
-
     # ---- main flow (runs entirely on a background thread) -------------
 
     def run_flow(self) -> None:
@@ -400,8 +322,6 @@ class CastletoolApp(App):
 
     def _flow(self) -> None:
         io = self.io
-
-        self._maybe_show_update_message()
 
         ct.check_for_update()
         ct.ensure_dependencies()
@@ -465,8 +385,6 @@ class CastletoolApp(App):
             if ct.HAS_MIDO:
                 options.append("Add MIDI")
             options.append("Edit Background Color")
-            if ct._env_flag("CASTLETOOL_HTML"):
-                options.append("Upload HTML")
             options.append("Upload Deck")
             options.append("Exit Tool")
 
@@ -478,8 +396,6 @@ class CastletoolApp(App):
                 ct.do_add_midi(bp_path, actor, card)
             elif action == "Edit Background Color":
                 ct.do_edit_background_color(card)
-            elif action == "Upload HTML":
-                ct.do_upload_html(deck, card)
             elif action == "Upload Deck":
                 ct.do_upload_deck(deck)
             elif action == "Exit Tool":

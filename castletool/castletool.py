@@ -1139,6 +1139,12 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
     is_anim = ext in (".gif", ".webp", ".mp4", ".mov", ".webm", ".avi")
     is_video = ext in (".mp4", ".mov", ".webm", ".avi")
     is_vector = ext in (".svg",)
+    if ext in (".png", ".apng"):
+        # Plain PNGs are never animated, but an APNG (still a .png/.apng file
+        # on disk, just with an acTL chunk) is. Pillow already exposes that
+        # via is_animated, so just ask it instead of assuming from extension.
+        with Image.open(img_path) as _probe:
+            is_anim = getattr(_probe, "is_animated", False)
     file_size = img_path.stat().st_size
 
     # native size + scale
@@ -1272,228 +1278,9 @@ def do_add_midi(bp_path: Path, actor: dict, card: Path):
     ps("MIDI added.")
 
 
-CASTLE_API_URL = "https://api.castle.xyz/graphql"
-
 def _env_flag(name: str) -> bool:
     """True if an env var is set to a truthy value (unset/'0'/'false'/'' = off)."""
     return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
-
-def find_castle_token() -> str | None:
-    """Look for a Castle CLI login token in the usual config locations."""
-    candidates = []
-    for var in ("CASTLE_CLI_HOME", "CASTLE_HOME"):
-        val = os.environ.get(var)
-        if val:
-            candidates.append(Path(val))
-    candidates.append(Path.home() / ".castle")
-    for d in candidates:
-        cfg = d / "config.json"
-        if cfg.exists():
-            try:
-                token = json.loads(cfg.read_text(encoding="utf-8")).get("token")
-                if token:
-                    return token
-            except (json.JSONDecodeError, OSError):
-                continue
-    return None
-
-def _castle_graphql(token: str, query: str, variables: dict) -> dict:
-    payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
-    req = urllib.request.Request(
-        CASTLE_API_URL, data=payload, method="POST",
-        headers={
-            "X-OS": "cli",
-            "X-CLI-API-Version": "4",
-            "X-Scene-Creator-Version": "latest",
-            "X-Auth-Token": token,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return json.loads(e.read())
-
-def _multipart_post(url, fields: dict, file_field_name, file_bytes, file_name, content_type):
-    boundary = uuid.uuid4().hex
-    parts = []
-    for key, val in fields.items():
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{val}\r\n'.encode())
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field_name}"; '
-        f'filename="{file_name}"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
-    parts.append(file_bytes)
-    parts.append(f'\r\n--{boundary}--\r\n'.encode())
-    req = urllib.request.Request(url, data=b"".join(parts), method="POST")
-    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-
-
-def do_upload_html(deck: Path, card: Path):
-    while True:
-        raw = ask_path("Enter the file path for your HTML file")
-        html_path = resolve_path(raw)
-        if html_path.exists():
-            break
-        pe(f"File not found: {html_path}")
-
-    with open(deck / "deck.json", "r", encoding="utf-8") as f:
-        deck_meta = json.load(f)
-    deck_id = deck_meta.get("deckId")
-    if not deck_id:
-        pe("This deck hasn't been uploaded yet. Use Upload Deck first, then try again.")
-        return
-    card_id = card.name
-
-    token = find_castle_token()
-    if not token:
-        pe("Castle token not found. Run 'castle login' first.")
-        return
-
-    p()
-    pb("Reading target deck metadata...")
-    try:
-        deck_resp = _castle_graphql(token, """
-            query($deckId: ID!) {
-              deck(deckId: $deckId) {
-                title visibility variables
-                initialCard { cardId title sceneDataUrl }
-                cards { cardId title sceneDataUrl }
-              }
-            }""", {"deckId": deck_id})
-    except Exception as e:
-        pe(f"Failed to reach Castle: {e}")
-        return
-
-    deck_data = (deck_resp.get("data") or {}).get("deck")
-    if not deck_data:
-        pe("Castle didn't return this deck. Check that it's still yours and still exists.")
-        return
-
-    cards = deck_data.get("cards") or [deck_data.get("initialCard")]
-    card_json = next((c for c in cards if c and c.get("cardId") == card_id), None)
-    if not card_json:
-        pe(f"Card {card_id} is not inside deck {deck_id}.")
-        return
-
-    scene_url = card_json.get("sceneDataUrl")
-    card_title = card_json.get("title") or "Card"
-    is_initial = (deck_data.get("initialCard") or {}).get("cardId") == card_id
-    deck_title = deck_data.get("title") or "Untitled"
-    deck_visibility = deck_data.get("visibility") or "unlisted"
-    deck_variables = deck_data.get("variables") or []
-
-    if scene_url:
-        pb("Downloading existing scene file...")
-        try:
-            with urllib.request.urlopen(scene_url, timeout=15) as resp:
-                scene = json.loads(resp.read())
-        except Exception as e:
-            pe(f"Failed to download scene data: {e}")
-            return
-    else:
-        pb("No scene data url found. Creating blank snapshot...")
-        scene = {"snapshot": {}}
-
-    pb("Injecting HTML file into experimentalWeb bundle...")
-    scene["experimentalWeb"] = {"enabled": True, "bundle": html_path.read_text(encoding="utf-8")}
-    scene_bytes = json.dumps(scene).encode("utf-8")
-
-    pb("Requesting signed upload parameters...")
-    try:
-        upload_resp = _castle_graphql(token, """
-            mutation($cardIds: [ID!]!) {
-              createSceneDataUploadConfig(cardIds: $cardIds) {
-                uploadId postUrl postFields
-              }
-            }""", {"cardIds": [card_id]})
-    except Exception as e:
-        pe(f"Failed to reach Castle: {e}")
-        return
-
-    configs = (upload_resp.get("data") or {}).get("createSceneDataUploadConfig") or []
-    if not configs:
-        pe("Castle did not return an upload configuration.")
-        return
-    upload_config = configs[0]
-    post_fields = upload_config.get("postFields") or {}
-
-    # If the presigned POST policy declares a max size, check up front so we
-    # get a clear error instead of an opaque HTTP failure later.
-    policy_b64 = post_fields.get("policy")
-    if policy_b64:
-        try:
-            policy = json.loads(base64.b64decode(policy_b64))
-            max_bytes = next(
-                (c[2] for c in policy.get("conditions", [])
-                 if isinstance(c, list) and c and c[0] == "content-length-range"),
-                None)
-            if max_bytes is not None and len(scene_bytes) > max_bytes:
-                pe("Your file is too large!")
-                return
-        except Exception:
-            pass
-
-    upload_id = upload_config.get("uploadId")
-    post_url = upload_config.get("postUrl")
-
-    pb("Uploading patched scene payload...")
-    fields = {"Content-Type": "application/json", **post_fields}
-    try:
-        status, body = _multipart_post(post_url, fields, "file", scene_bytes,
-                                        "scene.json", "application/json")
-    except Exception as e:
-        pe(f"Scene data upload failed: {e}")
-        return
-    if status >= 300:
-        pe(f"Scene data upload failed with HTTP {status}")
-        return
-
-    pb("Attaching upload reference to deck...")
-    deck_input = {
-        "deckId": deck_id,
-        "title": deck_title,
-        "visibility": deck_visibility,
-        "contentFlags": {
-            "bloodOrGuns": False, "profanity": False, "sexuallySuggestive": False,
-            "horrorOrFear": False, "alcoholOrDrugs": False, "loudSounds": False,
-            "flashingLights": False,
-        },
-    }
-    card_input = {"cardId": card_id, "title": card_title, "blocks": [], "uploadId": upload_id}
-    if is_initial:
-        deck_input["initialCardId"] = card_id
-        deck_input["variables"] = deck_variables
-        card_input["makeInitialCard"] = True
-
-    try:
-        update_resp = _castle_graphql(token, """
-            mutation($deck: DeckInput!, $card: CardInput!) {
-              updateCardAndDeckV2(deck: $deck, card: $card) {
-                deck { deckId }
-                card { cardId }
-              }
-            }""", {"deck": deck_input, "card": card_input})
-    except Exception as e:
-        pe(f"Failed to reach Castle: {e}")
-        return
-
-    final_deck_id = (((update_resp.get("data") or {})
-                      .get("updateCardAndDeckV2") or {})
-                     .get("deck") or {}).get("deckId")
-    if not final_deck_id:
-        pe("Castle rejected the deck update.")
-        return
-
-    ps("HTML uploaded!")
-    pb(f"Live at: https://castle.xyz/d/{deck_id}")
 
 
 def do_upload_deck(deck: Path):
@@ -1596,8 +1383,6 @@ def main():
         if HAS_MIDO:
             options.append("Add MIDI")
         options.append("Edit Background Color")
-        if _env_flag("CASTLETOOL_HTML"):
-            options.append("Upload HTML")
         options.append("Upload Deck")
         options.append("Exit Tool")
 
@@ -1609,8 +1394,6 @@ def main():
             do_add_midi(bp_path, actor, card)
         elif action == "Edit Background Color":
             do_edit_background_color(card)
-        elif action == "Upload HTML":
-            do_upload_html(deck, card)
         elif action == "Upload Deck":
             do_upload_deck(deck)
         elif action == "Exit Tool":
