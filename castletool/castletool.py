@@ -1327,56 +1327,79 @@ def main():
     ensure_dependencies()
     p()
 
-    # ── select deck ──
     home = Path.cwd()
-    decks = find_decks(home)
-    if not decks:
-        pe("No decks were found. Are you in the right directory?")
-        sys.exit(1)
+    deck = card = bp_path = actor = None
+    stage = "deck"
 
-    deck_names = [d.name for d in decks]
-    pb(f"Detected decks: {', '.join(deck_names)}")
-    if len(decks) == 1:
-        deck = decks[0]
-        ps(f"Auto selecting {deck.name}")
-    else:
-        chosen = choose("Select the deck you would like to modify:", deck_names)
-        deck = home / chosen
-    p()
-
-    # ── select card ──
-    cards = find_cards(deck)
-    if not cards:
-        pe(f"No cards found in {deck}.")
-        sys.exit(1)
-    card_names = [c.name for c in cards]
-    if len(cards) == 1:
-        card = cards[0]
-        ps(f"Auto selecting {card.name}")
-    else:
-        chosen = choose("Select the card you would like to edit:", card_names)
-        card = deck / "cards" / chosen
-    p()
-
-    # ── select blueprint (actor) ──
-    blueprints = find_blueprints(card)
-    if not blueprints:
-        pe(f"No blueprints found in {card}.")
-        sys.exit(1)
-    bp_names = [b.name for b in blueprints]
-    if len(blueprints) == 1:
-        bp_path = blueprints[0]
-        ps(f"Auto selecting {bp_path.name}")
-    else:
-        chosen = choose("Select the actor you want to edit:", bp_names)
-        bp_path = card / "scene" / "blueprints" / chosen
-    p()
-
-    with open(bp_path, "r", encoding="utf-8") as f:
-        actor = json.load(f)
-
-    # ── action menu ──
     while True:
+        if stage == "deck":
+            decks = find_decks(home)
+            if not decks:
+                pe("No decks were found. Are you in the right directory?")
+                sys.exit(1)
+            deck_names = [d.name for d in decks]
+            pb(f"Detected decks: {', '.join(deck_names)}")
+            if len(decks) == 1:
+                deck = decks[0]
+                ps(f"Auto selecting {deck.name}")
+            else:
+                chosen = choose("Select the deck you would like to modify:",
+                                 [*deck_names, "Exit Tool"])
+                if chosen == "Exit Tool":
+                    return
+                deck = home / chosen
+            p()
+            stage = "card"
+            continue
+
+        if stage == "card":
+            cards = find_cards(deck)
+            if not cards:
+                pe(f"No cards found in {deck}.")
+                sys.exit(1)
+            card_names = [c.name for c in cards]
+            if len(cards) == 1:
+                card = cards[0]
+                ps(f"Auto selecting {card.name}")
+            else:
+                chosen = choose("Select the card you would like to edit:",
+                                 [*card_names, "« Change Deck", "Exit Tool"])
+                if chosen == "Exit Tool":
+                    return
+                if chosen == "« Change Deck":
+                    stage = "deck"
+                    continue
+                card = deck / "cards" / chosen
+            p()
+            stage = "blueprint"
+            continue
+
+        if stage == "blueprint":
+            blueprints = find_blueprints(card)
+            if not blueprints:
+                pe(f"No blueprints found in {card}.")
+                sys.exit(1)
+            bp_names = [b.name for b in blueprints]
+            if len(blueprints) == 1:
+                bp_path = blueprints[0]
+                ps(f"Auto selecting {bp_path.name}")
+            else:
+                chosen = choose("Select the actor you want to edit:",
+                                 [*bp_names, "« Change Card", "Exit Tool"])
+                if chosen == "Exit Tool":
+                    return
+                if chosen == "« Change Card":
+                    stage = "card"
+                    continue
+                bp_path = card / "scene" / "blueprints" / chosen
+            p()
+
+            with open(bp_path, "r", encoding="utf-8") as f:
+                actor = json.load(f)
+            stage = "action"
+            continue
+
+        # ── action menu ──
         options = []
         if HAS_PIL:
             options.append("Add image")
@@ -1384,6 +1407,7 @@ def main():
             options.append("Add MIDI")
         options.append("Edit Background Color")
         options.append("Upload Deck")
+        options.append("« Change Blueprint")
         options.append("Exit Tool")
 
         action = choose("Select the action you want to perform:", options)
@@ -1396,9 +1420,11 @@ def main():
             do_edit_background_color(card)
         elif action == "Upload Deck":
             do_upload_deck(deck)
+        elif action == "« Change Blueprint":
+            stage = "blueprint"
         elif action == "Exit Tool":
-            break
-    p()
+            p()
+            return
 
 
 if __name__ == "__main__":

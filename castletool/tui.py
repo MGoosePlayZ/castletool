@@ -326,59 +326,82 @@ class CastletoolApp(App):
         ct.check_for_update()
         ct.ensure_dependencies()
 
-        # ── select deck ──
         home = Path.cwd()
-        decks = ct.find_decks(home)
-        if not decks:
-            io.pe("No decks were found. Are you in the right directory?")
-            io.pause()
-            return
+        deck = card = bp_path = actor = None
+        stage = "deck"
 
-        deck_names = [d.name for d in decks]
-        if len(decks) == 1:
-            deck = decks[0]
-            io.ps(f"Auto selecting {deck.name}")
-        else:
-            io.pb(f"Detected decks: {', '.join(deck_names)}")
-            chosen = io.choose("Select the deck you would like to modify:", deck_names)
-            deck = home / chosen
-        io.p()
-
-        # ── select card ──
-        cards = ct.find_cards(deck)
-        if not cards:
-            io.pe(f"No cards found in {deck}.")
-            io.pause()
-            return
-        card_names = [c.name for c in cards]
-        if len(cards) == 1:
-            card = cards[0]
-            io.ps(f"Auto selecting {card.name}")
-        else:
-            chosen = io.choose("Select the card you would like to edit:", card_names)
-            card = deck / "cards" / chosen
-        io.p()
-
-        # ── select blueprint (actor) ──
-        blueprints = ct.find_blueprints(card)
-        if not blueprints:
-            io.pe(f"No blueprints found in {card}.")
-            io.pause()
-            return
-        bp_names = [b.name for b in blueprints]
-        if len(blueprints) == 1:
-            bp_path = blueprints[0]
-            io.ps(f"Auto selecting {bp_path.name}")
-        else:
-            chosen = io.choose("Select the actor you want to edit:", bp_names)
-            bp_path = card / "scene" / "blueprints" / chosen
-        io.p()
-
-        with open(bp_path, "r", encoding="utf-8") as f:
-            actor = json.load(f)
-
-        # ── action menu ──
         while True:
+            if stage == "deck":
+                decks = ct.find_decks(home)
+                if not decks:
+                    io.pe("No decks were found. Are you in the right directory?")
+                    io.pause()
+                    return
+                deck_names = [d.name for d in decks]
+                if len(decks) == 1:
+                    deck = decks[0]
+                    io.ps(f"Auto selecting {deck.name}")
+                else:
+                    io.pb(f"Detected decks: {', '.join(deck_names)}")
+                    chosen = io.choose("Select the deck you would like to modify:",
+                                        [*deck_names, "Exit Tool"])
+                    if chosen == "Exit Tool":
+                        return
+                    deck = home / chosen
+                io.p()
+                stage = "card"
+                continue
+
+            if stage == "card":
+                cards = ct.find_cards(deck)
+                if not cards:
+                    io.pe(f"No cards found in {deck}.")
+                    io.pause()
+                    return
+                card_names = [c.name for c in cards]
+                if len(cards) == 1:
+                    card = cards[0]
+                    io.ps(f"Auto selecting {card.name}")
+                else:
+                    chosen = io.choose("Select the card you would like to edit:",
+                                        [*card_names, "« Change Deck", "Exit Tool"])
+                    if chosen == "Exit Tool":
+                        return
+                    if chosen == "« Change Deck":
+                        stage = "deck"
+                        continue
+                    card = deck / "cards" / chosen
+                io.p()
+                stage = "blueprint"
+                continue
+
+            if stage == "blueprint":
+                blueprints = ct.find_blueprints(card)
+                if not blueprints:
+                    io.pe(f"No blueprints found in {card}.")
+                    io.pause()
+                    return
+                bp_names = [b.name for b in blueprints]
+                if len(blueprints) == 1:
+                    bp_path = blueprints[0]
+                    io.ps(f"Auto selecting {bp_path.name}")
+                else:
+                    chosen = io.choose("Select the actor you want to edit:",
+                                        [*bp_names, "« Change Card", "Exit Tool"])
+                    if chosen == "Exit Tool":
+                        return
+                    if chosen == "« Change Card":
+                        stage = "card"
+                        continue
+                    bp_path = card / "scene" / "blueprints" / chosen
+                io.p()
+
+                with open(bp_path, "r", encoding="utf-8") as f:
+                    actor = json.load(f)
+                stage = "action"
+                continue
+
+            # ── action menu ──
             options = []
             if ct.HAS_PIL:
                 options.append("Add image")
@@ -386,6 +409,7 @@ class CastletoolApp(App):
                 options.append("Add MIDI")
             options.append("Edit Background Color")
             options.append("Upload Deck")
+            options.append("« Change Blueprint")
             options.append("Exit Tool")
 
             action = io.choose("Select the action you want to perform:", options)
@@ -398,8 +422,10 @@ class CastletoolApp(App):
                 ct.do_edit_background_color(card)
             elif action == "Upload Deck":
                 ct.do_upload_deck(deck)
+            elif action == "« Change Blueprint":
+                stage = "blueprint"
             elif action == "Exit Tool":
-                break
+                return
 
 
 def main() -> None:
