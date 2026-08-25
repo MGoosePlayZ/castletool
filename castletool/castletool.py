@@ -973,7 +973,7 @@ def make_tick_scaler(tempo_map: list[tuple[int, int]]):
 def collect_midi_tracks(mid) -> list[dict]:
     """
     Returns one entry per non-empty MIDI track:
-    {"events": [(beat, note), ...], "program": int, "is_drum": bool}
+    {"events": [(beat, note, velocity), ...], "program": int, "is_drum": bool}
 
     Since a Castle track only has one instrument, each MIDI track is
     reduced to a single representative (channel, program) pair: whichever
@@ -992,7 +992,7 @@ def collect_midi_tracks(mid) -> list[dict]:
             if msg.type == "program_change":
                 programs[msg.channel] = msg.program
             elif msg.type == "note_on" and msg.velocity > 0:
-                events.append((scale(abs_tick) / tpb * 4, msg.note))
+                events.append((scale(abs_tick) / tpb * 4, msg.note, msg.velocity))
                 channel = msg.channel
                 usage[(channel, programs.get(channel, 0))] += 1
         if not events:
@@ -1053,14 +1053,14 @@ def build_music(mid, beats_per_bar: int = 4) -> dict:
         # merge every note in the track into a single pattern, keyed by
         # its absolute beat position (instead of one pattern per bar).
         notes_by_beat = {}
-        for beat, note in track["events"]:
+        for beat, note, velocity in track["events"]:
             # "key" already sits at the same octave the MIDI file uses
             # (raw note number), so bump it one octave higher per spec.
             octave_note = min(127, note + 12)
-            notes_by_beat.setdefault(round(beat, 9), []).append(octave_note)
+            notes_by_beat.setdefault(round(beat, 9), []).append((octave_note, velocity))
 
         pid = str(uuid.uuid4())
-        notes = {beat_key(b): [{"key": n} for n in ns]
+        notes = {beat_key(b): [{"key": n, "vel": v} for n, v in ns]
                  for b, ns in sorted(notes_by_beat.items())}
         patterns[pid] = {
             "patternId": pid,
