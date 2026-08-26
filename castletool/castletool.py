@@ -39,6 +39,14 @@ try:
 except ImportError:
     HAS_MIDO = False
 
+try:
+    from fontTools.ttLib import TTFont
+    from fontTools.pens.svgPathPen import SVGPathPen
+    from fontTools.pens.transformPen import TransformPen
+    HAS_FONTTOOLS = True
+except ImportError:
+    HAS_FONTTOOLS = False
+
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -49,6 +57,7 @@ RESET = "\033[0m"
 WARN  = "\033[33m"
 OK    = "\033[32m"
 ERR   = "\033[31m"
+BLUE  = "\033[34m"
 
 def p(msg=""):        print(msg)
 def pb(msg):          print(f"{BOLD}{msg}{RESET}")
@@ -89,6 +98,33 @@ def choose(prompt, options):
             return options[int(raw) - 1]
         p("Invalid choice.")
 
+def multi_choose(prompt, options):
+    """
+    Checklist: pick one or more options from a numbered list, then confirm.
+    Returns the list of chosen items (in the order they appear in `options`).
+    """
+    p()
+    pb(prompt)
+    for i, o in enumerate(options, 1):
+        print(f"  {i}) {o}")
+    while True:
+        raw = ask(f"Enter numbers separated by spaces or commas (1-{len(options)})")
+        parts = [x for x in raw.replace(",", " ").split() if x]
+        if not parts or not all(x.isdigit() for x in parts):
+            p("Enter one or more numbers from the list.")
+            continue
+        indices = sorted(set(int(x) for x in parts))
+        if any(i < 1 or i > len(options) for i in indices):
+            p("Invalid choice.")
+            continue
+        selected = [options[i - 1] for i in indices]
+        p()
+        pb("Selected:")
+        for s in selected:
+            print(f"  • {s}")
+        if yn("Confirm this selection?", default="y"):
+            return selected
+
 def ask_path(prompt, default=None, search_dir: Path | None = None):
     """Plain file path input."""
     suffix = f" [{default}]" if default is not None else ""
@@ -98,6 +134,120 @@ def ask_path(prompt, default=None, search_dir: Path | None = None):
     except (EOFError, KeyboardInterrupt):
         p(); sys.exit(0)
     return val if val else (default or "")
+
+
+# ── character/codepoint spec parsing (shared by basic + advanced font UI) ────
+# Grammar: whitespace-separated words. A word containing "U+"/"u+" must be
+# exactly one U+XXXX codepoint token (codepoints must be separated by
+# spaces -- gluing two together, e.g. "U+03A9U+0021", is malformed). Any
+# other word is a run of literal characters, each one its own codepoint.
+# A codepoint appearing more than once anywhere in the spec is a duplicate.
+
+_CODEPOINT_RE = re.compile(r"[Uu]\+([0-9A-Fa-f]+)")
+
+def parse_charspec_tokens(text: str):
+    """
+    Returns (tokens, seen_counts, valid).
+    tokens: [(word, kind, codepoints_or_None), ...] in input order, where
+      kind is "chars", "codepoint", or "malformed".
+    seen_counts: codepoint -> total occurrences across the whole spec.
+    valid: True only if there's at least one word, no malformed tokens,
+      and no duplicate codepoints.
+    """
+    words = text.split()
+    tokens = []
+    seen_counts: dict[int, int] = {}
+    for word in words:
+        if "u+" in word.lower():
+            m = _CODEPOINT_RE.fullmatch(word)
+            if m:
+                cp = int(m.group(1), 16)
+                tokens.append((word, "codepoint", [cp]))
+                seen_counts[cp] = seen_counts.get(cp, 0) + 1
+            else:
+                tokens.append((word, "malformed", None))
+        else:
+            cps = [ord(ch) for ch in word]
+            tokens.append((word, "chars", cps))
+            for cp in cps:
+                seen_counts[cp] = seen_counts.get(cp, 0) + 1
+    has_malformed = any(kind == "malformed" for _, kind, _ in tokens)
+    has_dup = any(count > 1 for count in seen_counts.values())
+    valid = bool(words) and not has_malformed and not has_dup
+    return tokens, seen_counts, valid
+
+def charspec_codepoints(text: str) -> list[int]:
+    """Resolve a *valid* charspec string to a sorted, deduped codepoint list."""
+    _tokens, seen_counts, _valid = parse_charspec_tokens(text)
+    return sorted(seen_counts.keys())
+
+def charspec_preview_parts(text: str):
+    """[(fragment, color_or_None), ...] -- color is 'blue', 'red', or None."""
+    tokens, seen_counts, _valid = parse_charspec_tokens(text)
+    parts = []
+    for i, (word, kind, cps) in enumerate(tokens):
+        if i > 0:
+            parts.append((" ", None))
+        if kind == "malformed":
+            parts.append((word, "red"))
+        elif kind == "codepoint":
+            parts.append((word, "red" if seen_counts[cps[0]] > 1 else "blue"))
+        else:
+            for ch, cp in zip(word, cps):
+                parts.append((ch, "red" if seen_counts[cp] > 1 else "blue"))
+    return parts
+
+def charspec_preview_ansi(text: str) -> str:
+    ansi = {"red": ERR, "blue": BLUE, None: ""}
+    out = []
+    for frag, color in charspec_preview_parts(text):
+        out.append(f"{ansi[color]}{frag}{RESET}" if color else frag)
+    return "".join(out)
+
+def charspec_preview_rich(text: str) -> str:
+    """Same preview, as Rich markup (for the Textual TUI)."""
+    out = []
+    for frag, color in charspec_preview_parts(text):
+        esc = frag.replace("\\", "\\\\").replace("[", "\\[")
+        out.append(f"[{color}]{esc}[/{color}]" if color else esc)
+    return "".join(out)
+
+def read_charspec_file(path: Path) -> str:
+    """
+    Read a charspec file: '--' starts a line comment (chosen specifically
+    so it can't be triggered by accident), blank/comment-only lines and
+    newlines are dropped, and everything else is joined with spaces.
+    """
+    cleaned = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        idx = line.find("--")
+        if idx != -1:
+            line = line[:idx]
+        line = line.strip()
+        if line:
+            cleaned.append(line)
+    return " ".join(cleaned)
+
+def ask_charspec(prompt: str) -> str:
+    """
+    Loop until the user enters a valid character/codepoint spec, printing
+    a colored preview each try (blue = recognized, red = duplicate or
+    malformed). Returns the validated text.
+    """
+    while True:
+        pb(prompt)
+        try:
+            text = input(f"{BOLD}> {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            p(); sys.exit(0)
+        if not text:
+            pe("Enter at least one character or codepoint.")
+            continue
+        print("  " + charspec_preview_ansi(text))
+        _tokens, _seen, valid = parse_charspec_tokens(text)
+        if valid:
+            return text
+        pe("Fix the highlighted characters/codepoints (duplicates or malformed U+.... tokens) and try again.")
 
 
 def resolve_path(raw: str) -> Path:
@@ -184,11 +334,12 @@ def check_for_update(include_prereleases: bool | None = None):
 
 def ensure_dependencies():
     """Best-effort auto-install of missing dependencies."""
-    global HAS_PIL, HAS_MIDO, HAS_FFMPEG, Image, mido
+    global HAS_PIL, HAS_MIDO, HAS_FONTTOOLS, HAS_FFMPEG, Image, mido, TTFont, SVGPathPen, TransformPen
 
     pip_missing = []
     if not HAS_PIL:  pip_missing.append("Pillow")
     if not HAS_MIDO: pip_missing.append("mido")
+    if not HAS_FONTTOOLS: pip_missing.append("fonttools")
 
     if pip_missing:
         pb(f"Installing {', '.join(pip_missing)}...")
@@ -218,6 +369,14 @@ def ensure_dependencies():
             HAS_MIDO = True
         except ImportError:
             HAS_MIDO = False
+        try:
+            from fontTools.ttLib import TTFont as _TTFont
+            from fontTools.pens.svgPathPen import SVGPathPen as _SVGPathPen
+            from fontTools.pens.transformPen import TransformPen as _TransformPen
+            TTFont, SVGPathPen, TransformPen = _TTFont, _SVGPathPen, _TransformPen
+            HAS_FONTTOOLS = True
+        except ImportError:
+            HAS_FONTTOOLS = False
         HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 # ── deck / card / blueprint discovery ────────────────────────────────────────
@@ -902,6 +1061,147 @@ def build_drawing2_vector(path_data, bounds, fill_bounds,
     }
 
 
+# ── font → Drawing2 (one actor, one frame per glyph) ─────────────────────────
+# Every glyph is rendered in the SAME font-space coordinate system (baseline
+# at y=0, each glyph's own natural left-side-bearing at x=0) rather than
+# being individually re-centered on its own bounding box like svg_to_path_data
+# does for standalone images. That keeps every frame anchored to one shared
+# pen origin, so switching which frame is showing doesn't jump the glyph
+# around -- it just swaps the shape, the way a real font's glyphs share one
+# baseline.
+
+# Named unicode ranges a user can pick from. Each entry is either an
+# (start, end) inclusive codepoint range, or a callable returning a list of
+# codepoints for sets that aren't one contiguous range.
+def _charset_standard():
+    # 0-255 excluding the C0 controls, DEL, and the C1 controls.
+    return [cp for cp in range(0x00, 0x100)
+            if not (cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F)]
+
+def _charset_alphanumeric():
+    return list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) + list(range(0x61, 0x7B))
+
+FONT_CHARSETS = {
+    "Standard (0-255, no control chars)": _charset_standard,
+    "ASCII": lambda: list(range(0x20, 0x7F)),
+    "Alphanumeric": _charset_alphanumeric,
+    "Numeric": lambda: list(range(0x0030, 0x003A)),
+    "Currency Symbols": lambda: list(range(0x20A0, 0x20D0)),
+    "Greek Characters": lambda: list(range(0x0391, 0x03CA)),
+    "Fraction Symbols": lambda: list(range(0x2150, 0x2160)),
+    "Arrows": lambda: list(range(0x2190, 0x2200)),
+    "Mathematical Operators": lambda: list(range(0x2200, 0x2300)),
+    "Miscellaneous Technical": lambda: list(range(0x2300, 0x2400)),
+    "Box Drawing": lambda: list(range(0x2500, 0x2580)),
+    "Block Elements": lambda: list(range(0x2580, 0x25A0)),
+    "Dingbats": lambda: list(range(0x2700, 0x27C0)),
+    "Braille Patterns": lambda: list(range(0x2800, 0x2900)),
+    "Musical Symbols": lambda: list(range(0x1D100, 0x1D200)),
+}
+
+def font_glyph_svg_d(glyph_set, glyph_name: str) -> str:
+    """
+    Y-flipped SVG-style path 'd' string for one glyph. Font outlines are
+    already Y-up (matching Castle), but _svg_path_to_polylines feeds into
+    the same to-Castle math svg_to_path_data uses, which expects Y-down
+    (real SVG convention) and flips it back -- so the outline is flipped
+    once here to round-trip correctly.
+    """
+    svg_pen = SVGPathPen(glyph_set)
+    flip_pen = TransformPen(svg_pen, (1, 0, 0, -1, 0, 0))
+    glyph_set[glyph_name].draw(flip_pen)
+    return svg_pen.getCommands()
+
+def font_glyph_to_path_data(d: str, steps: int, ppu: float, scale: float,
+                             color: list) -> tuple[list[dict], dict]:
+    """
+    Convert one glyph's Y-flipped path 'd' string into Castle pathDataList
+    segments, in the SHARED font-space coordinate system (no per-glyph
+    recentring -- see module note above).
+    """
+    polylines = _svg_path_to_polylines(d, steps)
+    path_data = []
+    all_xs, all_ys = [], []
+    for poly in polylines:
+        if len(poly) < 2:
+            continue
+        castle_pts = [(x / ppu * scale, -(y / ppu) * scale) for x, y in poly]
+        for j in range(len(castle_pts) - 1):
+            x1, y1 = castle_pts[j]
+            x2, y2 = castle_pts[j + 1]
+            path_data.append({
+                "p": [round(x1, 5), round(y1, 5), round(x2, 5), round(y2, 5)],
+                "s": 1, "f": False,
+                "c": [round(v, 5) for v in color],
+            })
+            all_xs.extend([x1, x2])
+            all_ys.extend([y1, y2])
+    if not all_xs:
+        bounds = {"minX": 0, "maxX": 0, "minY": 0, "maxY": 0}
+    else:
+        bounds = {
+            "minX": round(min(all_xs), 5), "maxX": round(max(all_xs), 5),
+            "minY": round(min(all_ys), 5), "maxY": round(max(all_ys), 5),
+        }
+    return path_data, bounds
+
+def build_drawing2_font(glyph_frames: list[tuple[int, list, dict]],
+                         ppu: float, scale: float = 10) -> dict:
+    """
+    glyph_frames: [(codepoint, path_data, bounds), ...] in the order they
+    should appear as frames 1, 2, 3, ...
+    """
+    castle_frames, frame_bounds = [], []
+    for _cp, path_data, bounds in glyph_frames:
+        castle_frames.append({
+            "isLinked": False,
+            "pathDataList": path_data,
+            "fillImageBounds": bounds,
+            "avatarX": 0, "avatarY": 0, "avatarRadius": 5,
+        })
+        frame_bounds.append(bounds)
+
+    overall = {
+        "minX": min((b["minX"] for b in frame_bounds), default=-5),
+        "maxX": max((b["maxX"] for b in frame_bounds), default=5),
+        "minY": min((b["minY"] for b in frame_bounds), default=-5),
+        "maxY": max((b["maxY"] for b in frame_bounds), default=5),
+    }
+
+    return {
+        "initialFrame": 1, "currentFrame": 1,
+        "framesPerSecond": 4,
+        "playMode": "still",
+        "loopStartFrame": -1, "loopEndFrame": -1,
+        "opacity": 1,
+        "hash": str(abs(hash(str(glyph_frames))))[:19],
+        "playing": False, "loop": False,
+        "drawData": {
+            "color": [1, 1, 1, 1], "lineColor": [0, 0, 0, 1],
+            "gridSize": 0.71428, "scale": scale, "version": 3,
+            "fillPixelsPerUnit": ppu,
+            "numTotalLayers": 1,
+            "framesBounds": frame_bounds,
+            "colors": [], "selectedFrame": 1,
+            "layers": [{
+                "title": "Layer 1", "id": "layer1",
+                "isVisible": True, "isBitmap": False, "isAvatar": False,
+                "frames": castle_frames,
+            }],
+        },
+        "physicsBodyData": {
+            "shapes": [{
+                "p1": {"x": overall["maxX"], "y": overall["maxY"]},
+                "p2": {"x": overall["minX"], "y": overall["minY"]},
+                "p3": {"x": 0, "y": 0}, "radius": 0, "x": 0, "y": 0,
+                "type": "rectangle",
+            }],
+            "scale": scale, "version": 2, "zeroShapesInV1": False,
+        },
+        "disabled": False,
+    }
+
+
 # ── midi → Music ─────────────────────────────────────────────────────────────
 
 def beat_key(b): return f"{b:.6f}"
@@ -1278,6 +1578,123 @@ def do_add_midi(bp_path: Path, actor: dict, card: Path):
     ps("MIDI added.")
 
 
+def do_add_font(bp_path: Path, actor: dict, card: Path):
+    while True:
+        raw = ask_path("Enter the font file path (.ttf or .otf)")
+        font_path = resolve_path(raw)
+        if font_path.exists():
+            break
+        pe(f"File not found: {font_path}")
+
+    p()
+    pb(f"Loading font: {font_path.name}")
+    try:
+        font = TTFont(font_path)
+        cmap = font.getBestCmap()
+        glyph_set = font.getGlyphSet()
+        upm = font["head"].unitsPerEm
+    except Exception as e:
+        pe(f"Could not read font file: {e}")
+        return
+    if not cmap:
+        pe("This font has no usable character map (cmap).")
+        return
+
+    charset_names = list(FONT_CHARSETS.keys())
+    mode = choose("Select a mode:", [
+        "Basic (choose from preset unicode ranges)",
+        "Advanced (choose exact characters/codepoints)",
+    ])
+
+    codepoints: list[int] = []
+    label = ""
+    if mode.startswith("Basic"):
+        chosen_sets = multi_choose("Select one or more character sets:", charset_names)
+        cp_set: set[int] = set()
+        for name in chosen_sets:
+            cp_set.update(FONT_CHARSETS[name]())
+        codepoints = sorted(cp_set)
+        label = ", ".join(chosen_sets)
+    else:
+        source = choose("How would you like to provide characters?",
+                         ["Type them in", "Load from a file"])
+        if source == "Type them in":
+            text = ask_charspec(
+                "Enter characters and/or codepoints "
+                "(e.g. 0123456789ABCDEF U+03A9), separated by spaces:"
+            )
+        else:
+            while True:
+                raw = ask_path("Enter the path to your character/codepoint file")
+                file_path = resolve_path(raw)
+                if file_path.exists():
+                    break
+                pe(f"File not found: {file_path}")
+            text = read_charspec_file(file_path)
+            print("  " + charspec_preview_ansi(text))
+            _tokens, _seen, valid = parse_charspec_tokens(text)
+            if not valid:
+                pe("This file has duplicate or malformed characters/codepoints "
+                   "(highlighted above). Fix it and try again.")
+                return
+        codepoints = charspec_codepoints(text)
+        label = "custom selection"
+
+    if not codepoints:
+        pe("No characters/codepoints were selected.")
+        return
+
+    p()
+    raw = ask("Scale multiplier (1.0 = one Castle unit per em)", default="1.0")
+    try:
+        scale = float(raw)
+        if scale <= 0:
+            raise ValueError
+    except ValueError:
+        pw("Invalid scale, using 1.0.")
+        scale = 1.0
+
+    steps = 16
+    if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
+        while True:
+            raw = ask("Steps per curve segment", default="16")
+            if raw.isdigit() and int(raw) >= 2:
+                steps = int(raw)
+                break
+            pe("Enter a number ≥ 2")
+
+    ppu = upm  # 1 em = 1 Castle unit before the user's scale multiplier
+    color = [0, 0, 0, 1]
+
+    p()
+    pb(f"Rendering {len(codepoints)} glyph(s) from '{label}'...")
+    glyph_frames = []
+    missing = 0
+    for cp in codepoints:
+        glyph_name = cmap.get(cp)
+        if not glyph_name or glyph_name not in glyph_set:
+            missing += 1
+            continue
+        d = font_glyph_svg_d(glyph_set, glyph_name)
+        path_data, bounds = font_glyph_to_path_data(d, steps, ppu, scale, color)
+        glyph_frames.append((cp, path_data, bounds))
+
+    if not glyph_frames:
+        pe("None of the requested codepoints have a glyph in this font.")
+        return
+
+    drawing2 = build_drawing2_font(glyph_frames, ppu, scale=10)
+    actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+    with open(bp_path, "w", encoding="utf-8") as f:
+        json.dump(actor, f, indent=2)
+
+    if missing:
+        pw(f"{missing} requested codepoint(s) have no glyph in this font and were skipped.")
+    ps(f"Font added: {len(glyph_frames)} frame(s), one per glyph (frame order matches codepoint order).")
+
+    maybe_delete_placeholder_script(card, bp_path)
+
+
 def _env_flag(name: str) -> bool:
     """True if an env var is set to a truthy value (unset/'0'/'false'/'' = off)."""
     return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
@@ -1405,6 +1822,8 @@ def main():
             options.append("Add image")
         if HAS_MIDO:
             options.append("Add MIDI")
+        if HAS_FONTTOOLS:
+            options.append("Add Font")
         options.append("Edit Background Color")
         options.append("Upload Deck")
         options.append("« Change Blueprint")
@@ -1416,6 +1835,8 @@ def main():
             do_add_image(bp_path, actor, card)
         elif action == "Add MIDI":
             do_add_midi(bp_path, actor, card)
+        elif action == "Add Font":
+            do_add_font(bp_path, actor, card)
         elif action == "Edit Background Color":
             do_edit_background_color(card)
         elif action == "Upload Deck":

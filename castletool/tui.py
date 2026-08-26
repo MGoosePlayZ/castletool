@@ -6,10 +6,11 @@ Textual.
 This module intentionally does not reimplement any of castletool's actual
 logic (image/MIDI conversion, Castle GraphQL calls, etc). Instead it swaps
 out the plain-terminal I/O primitives that module.castletool uses
-(`p`, `pb`, `pw`, `pe`, `ps`, `ask`, `yn`, `choose`, `ask_path`) for
-equivalents backed by Textual widgets, then drives the exact same
-`do_add_image` / `do_add_midi` / `do_edit_background_color` /
-`do_upload_deck` functions that the classic CLI uses.
+(`p`, `pb`, `pw`, `pe`, `ps`, `ask`, `yn`, `choose`, `multi_choose`,
+`ask_charspec`, `ask_path`) for equivalents backed by Textual widgets,
+then drives the exact same `do_add_image` / `do_add_midi` / `do_add_font` /
+`do_edit_background_color` / `do_upload_deck` functions that the classic
+CLI uses.
 
 Everything runs in a background thread (see `CastletoolApp.run_flow`) since
 that logic is written as ordinary blocking, synchronous code. Prompts are
@@ -27,6 +28,7 @@ from pathlib import Path
 
 try:
     from rich.markup import escape
+    from rich.text import Text
     from textual.app import App, ComposeResult
     from textual.containers import Vertical
     from textual.message import Message
@@ -76,6 +78,51 @@ class AnyKeyPrompt(Static, can_focus=True):
         self.post_message(self.Dismissed())
 
 
+class CheckOption(Static, can_focus=True):
+    """A checklist line: tap/click or Enter/Space toggles it on or off."""
+
+    class Toggled(Message):
+        def __init__(self, index: int) -> None:
+            self.index = index
+            super().__init__()
+
+    def __init__(self, label: str, index: int, checked: bool = False) -> None:
+        self.label = label
+        self.index = index
+        self.checked = checked
+        super().__init__(self._display_text())
+
+    def _display_text(self) -> str:
+        return f"  [{'x' if self.checked else ' '}] {self.label}"
+
+    def set_checked(self, checked: bool) -> None:
+        self.checked = checked
+        self.update(self._display_text())
+
+    def on_click(self) -> None:
+        self.post_message(self.Toggled(self.index))
+
+    def on_key(self, event) -> None:
+        if event.key in ("enter", "space"):
+            event.stop()
+            self.post_message(self.Toggled(self.index))
+
+
+class ConfirmButton(Static, can_focus=True):
+    """Submits whatever checklist/selection is currently pending."""
+
+    class Pressed(Message):
+        pass
+
+    def on_click(self) -> None:
+        self.post_message(self.Pressed())
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            self.post_message(self.Pressed())
+
+
 # ── bridges castletool's blocking I/O calls onto the Textual UI ─────────────
 
 class TuiIO:
@@ -108,6 +155,20 @@ class TuiIO:
         self.app.call_from_thread(self.app.mount_choice, prompt, options, event, box)
         event.wait()
         return options[box["index"]]
+
+    def multi_choose(self, prompt: str, options: list[str]) -> list[str]:
+        event = threading.Event()
+        box: dict = {}
+        self.app.call_from_thread(self.app.mount_multi_choice, prompt, options, event, box)
+        event.wait()
+        return [options[i] for i in box["indices"]]
+
+    def ask_charspec(self, prompt: str) -> str:
+        event = threading.Event()
+        box: dict = {}
+        self.app.call_from_thread(self.app.mount_charspec, prompt, event, box)
+        event.wait()
+        return box["value"]
 
     def yn(self, prompt: str, default: str = "y") -> bool:
         event = threading.Event()
@@ -188,6 +249,42 @@ class CastletoolApp(App):
         text-style: bold underline;
     }
 
+    CheckOption {
+        width: auto;
+        background: transparent;
+        color: white;
+    }
+
+    CheckOption:hover {
+        text-style: bold underline;
+    }
+
+    CheckOption:focus {
+        text-style: bold underline;
+    }
+
+    ConfirmButton {
+        width: auto;
+        background: transparent;
+        color: white;
+        margin-top: 1;
+    }
+
+    ConfirmButton:hover {
+        text-style: bold underline;
+    }
+
+    ConfirmButton:focus {
+        text-style: bold underline;
+    }
+
+    #charspec_preview {
+        background: transparent;
+        color: white;
+        height: auto;
+        padding: 0 0 0 2;
+    }
+
     Input {
         background: transparent;
         border: none;
@@ -220,6 +317,8 @@ class CastletoolApp(App):
         ct.ask = self.io.ask
         ct.yn = self.io.yn
         ct.choose = self.io.choose
+        ct.multi_choose = self.io.multi_choose
+        ct.ask_charspec = self.io.ask_charspec
         ct.ask_path = self.io.ask_path
 
         self._pending: tuple | None = None
@@ -277,6 +376,30 @@ class CastletoolApp(App):
         container.mount(widget)
         widget.focus()
 
+    def mount_multi_choice(self, prompt: str, options: list[str], event: threading.Event, box: dict) -> None:
+        self.log_line(prompt, "bold")
+        self.log_line("(tap to toggle, then Confirm)", "dim")
+        container = self.query_one("#prompt", Vertical)
+        container.remove_children()
+        checked = [False] * len(options)
+        self._pending = ("multi_choice", event, box, checked)
+        widgets = [CheckOption(opt, i) for i, opt in enumerate(options)]
+        for widget in widgets:
+            container.mount(widget)
+        container.mount(ConfirmButton("  ✓ Confirm selection"))
+        widgets[0].focus()
+
+    def mount_charspec(self, prompt: str, event: threading.Event, box: dict) -> None:
+        self.log_line(prompt, "bold")
+        container = self.query_one("#prompt", Vertical)
+        container.remove_children()
+        self._pending = ("charspec", event, box)
+        field = Input(placeholder="")
+        preview = Static("", id="charspec_preview")
+        container.mount(field)
+        container.mount(preview)
+        field.focus()
+
     # ---- prompt responses -----------------------------------------------
 
     def on_tap_option_chosen(self, message: TapOption.Chosen) -> None:
@@ -289,15 +412,68 @@ class CastletoolApp(App):
         self.log_line()
         event.set()
 
-    def on_input_submitted(self, message: Input.Submitted) -> None:
-        if not self._pending or self._pending[0] != "text":
+    def on_check_option_toggled(self, message: CheckOption.Toggled) -> None:
+        if not self._pending or self._pending[0] != "multi_choice":
             return
-        _, event, box = self._pending
-        box["value"] = message.value
+        _, _event, _box, checked = self._pending
+        checked[message.index] = not checked[message.index]
+        container = self.query_one("#prompt", Vertical)
+        widget = container.children[message.index]
+        widget.set_checked(checked[message.index])
+
+    def on_confirm_button_pressed(self, _message: ConfirmButton.Pressed) -> None:
+        if not self._pending or self._pending[0] != "multi_choice":
+            return
+        _, event, box, checked = self._pending
+        indices = [i for i, c in enumerate(checked) if c]
+        if not indices:
+            self.log_line("Select at least one option first.", "yellow")
+            return
+        box["indices"] = indices
         self._pending = None
         self._clear_prompt()
         self.log_line()
         event.set()
+
+    def on_input_changed(self, message: Input.Changed) -> None:
+        if not self._pending or self._pending[0] != "charspec":
+            return
+        try:
+            preview = self.query_one("#charspec_preview", Static)
+        except Exception:
+            return
+        text = message.value
+        if not text.strip():
+            preview.update("")
+            return
+        preview.update(Text.from_markup(ct.charspec_preview_rich(text)))
+
+    def on_input_submitted(self, message: Input.Submitted) -> None:
+        if not self._pending:
+            return
+        kind = self._pending[0]
+        if kind == "text":
+            _, event, box = self._pending
+            box["value"] = message.value
+            self._pending = None
+            self._clear_prompt()
+            self.log_line()
+            event.set()
+        elif kind == "charspec":
+            _, event, box = self._pending
+            text = message.value.strip()
+            if not text:
+                self.log_line("Enter at least one character or codepoint.", "yellow")
+                return
+            _tokens, _seen, valid = ct.parse_charspec_tokens(text)
+            if not valid:
+                self.log_line("Fix the highlighted characters/codepoints and try again.", "yellow")
+                return
+            box["value"] = text
+            self._pending = None
+            self._clear_prompt()
+            self.log_line()
+            event.set()
 
     def on_any_key_prompt_dismissed(self, message: AnyKeyPrompt.Dismissed) -> None:
         if not self._pending or self._pending[0] != "pause":
@@ -407,6 +583,8 @@ class CastletoolApp(App):
                 options.append("Add image")
             if ct.HAS_MIDO:
                 options.append("Add MIDI")
+            if ct.HAS_FONTTOOLS:
+                options.append("Add Font")
             options.append("Edit Background Color")
             options.append("Upload Deck")
             options.append("« Change Blueprint")
@@ -418,6 +596,8 @@ class CastletoolApp(App):
                 ct.do_add_image(bp_path, actor, card)
             elif action == "Add MIDI":
                 ct.do_add_midi(bp_path, actor, card)
+            elif action == "Add Font":
+                ct.do_add_font(bp_path, actor, card)
             elif action == "Edit Background Color":
                 ct.do_edit_background_color(card)
             elif action == "Upload Deck":
