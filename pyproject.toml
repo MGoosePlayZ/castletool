@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "castletool"
-version = "0.4.5"
+version = "0.4.6"
 description = "Interactive Castle deck editor for injecting images/GIFs/video/SVG, MIDI music, and vector-rendered fonts into Castle blueprint JSON files."
 authors = [
     { name = "MGoosePlayZ", email = "juniorboy62011@gmail.com" }

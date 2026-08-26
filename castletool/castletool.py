@@ -42,7 +42,6 @@ except ImportError:
 try:
     from fontTools.ttLib import TTFont
     from fontTools.pens.svgPathPen import SVGPathPen
-    from fontTools.pens.transformPen import TransformPen
     HAS_FONTTOOLS = True
 except ImportError:
     HAS_FONTTOOLS = False
@@ -134,6 +133,18 @@ def ask_path(prompt, default=None, search_dir: Path | None = None):
     except (EOFError, KeyboardInterrupt):
         p(); sys.exit(0)
     return val if val else (default or "")
+
+def ask_color(prompt: str, default=(0, 0, 0)) -> list:
+    """Ask for an RGB color (0-255 per channel). Returns [r, g, b, 1] as 0-1 floats."""
+    while True:
+        raw = ask(f"{prompt} (R G B, 0-255 each)",
+                   default=f"{default[0]} {default[1]} {default[2]}")
+        parts = raw.replace(",", " ").split()
+        if len(parts) == 3 and all(p.isdigit() for p in parts) and \
+           all(0 <= int(p) <= 255 for p in parts):
+            r, g, b = (int(p) / 255 for p in parts)
+            return [round(r, 5), round(g, 5), round(b, 5), 1]
+        pe("Enter three numbers 0-255, e.g. 255 0 128")
 
 
 # ── character/codepoint spec parsing (shared by basic + advanced font UI) ────
@@ -334,7 +345,7 @@ def check_for_update(include_prereleases: bool | None = None):
 
 def ensure_dependencies():
     """Best-effort auto-install of missing dependencies."""
-    global HAS_PIL, HAS_MIDO, HAS_FONTTOOLS, HAS_FFMPEG, Image, mido, TTFont, SVGPathPen, TransformPen
+    global HAS_PIL, HAS_MIDO, HAS_FONTTOOLS, HAS_FFMPEG, Image, mido, TTFont, SVGPathPen
 
     pip_missing = []
     if not HAS_PIL:  pip_missing.append("Pillow")
@@ -372,8 +383,7 @@ def ensure_dependencies():
         try:
             from fontTools.ttLib import TTFont as _TTFont
             from fontTools.pens.svgPathPen import SVGPathPen as _SVGPathPen
-            from fontTools.pens.transformPen import TransformPen as _TransformPen
-            TTFont, SVGPathPen, TransformPen = _TTFont, _SVGPathPen, _TransformPen
+            TTFont, SVGPathPen = _TTFont, _SVGPathPen
             HAS_FONTTOOLS = True
         except ImportError:
             HAS_FONTTOOLS = False
@@ -1101,15 +1111,14 @@ FONT_CHARSETS = {
 
 def font_glyph_svg_d(glyph_set, glyph_name: str) -> str:
     """
-    Y-flipped SVG-style path 'd' string for one glyph. Font outlines are
-    already Y-up (matching Castle), but _svg_path_to_polylines feeds into
-    the same to-Castle math svg_to_path_data uses, which expects Y-down
-    (real SVG convention) and flips it back -- so the outline is flipped
-    once here to round-trip correctly.
+    SVG-style path 'd' string for one glyph, in the font's own native
+    coordinate space (Y-up, baseline at 0). No pre-flip here -- the single
+    Y-negation in font_glyph_to_path_data's to-Castle conversion is what
+    orients it correctly; adding a second flip here would cancel that out
+    and undo it.
     """
     svg_pen = SVGPathPen(glyph_set)
-    flip_pen = TransformPen(svg_pen, (1, 0, 0, -1, 0, 0))
-    glyph_set[glyph_name].draw(flip_pen)
+    glyph_set[glyph_name].draw(svg_pen)
     return svg_pen.getCommands()
 
 def font_glyph_to_path_data(d: str, steps: int, ppu: float, scale: float,
@@ -1515,8 +1524,11 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
                     steps = int(raw)
                     break
                 pe("Enter a number ≥ 2")
+        svg_color = None
+        if yn("Override the SVG's own colors with a single custom color?", default="n"):
+            svg_color = ask_color("Enter override color")
         path_data, bounds, fill_bounds = svg_to_path_data(
-            img_path, steps=steps, scale=svg_scale)
+            img_path, steps=steps, scale=svg_scale, color=svg_color)
         drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
         ps(f"SVG ready: {len(path_data)} line segments")
     else:
@@ -1645,7 +1657,7 @@ def do_add_font(bp_path: Path, actor: dict, card: Path):
         return
 
     p()
-    raw = ask("Scale multiplier (1.0 = one Castle unit per em)", default="1.0")
+    raw = ask("Scale multiplier (1.0 = ten Castle units per em)", default="1.0")
     try:
         scale = float(raw)
         if scale <= 0:
@@ -1663,8 +1675,10 @@ def do_add_font(bp_path: Path, actor: dict, card: Path):
                 break
             pe("Enter a number ≥ 2")
 
-    ppu = upm  # 1 em = 1 Castle unit before the user's scale multiplier
+    ppu = upm / 10.0  # 1 em = 10 Castle units before the user's scale multiplier
     color = [0, 0, 0, 1]
+    if yn("Use a custom color instead of black?", default="n"):
+        color = ask_color("Enter glyph color")
 
     p()
     pb(f"Rendering {len(codepoints)} glyph(s) from '{label}'...")
