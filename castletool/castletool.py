@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import uuid
@@ -23,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.3.4"
+CURRENT_VERSION = "0.4.6"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -552,6 +553,177 @@ def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1) ->
         sys.exit(1)
 
     return frames, effective_fps
+
+
+def probe_has_audio(path: Path) -> bool:
+    """True if the video file has at least one audio stream."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True
+    )
+    return bool(probe.stdout.strip())
+
+
+def extract_audio_mp3(path: Path, out_path: Path):
+    """Extract the audio track to an MP3 (96k/44.1kHz/stereo) via ffmpeg."""
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(path), "-vn",
+         "-c:a", "libmp3lame", "-b:a", "96k", "-ar", "44100", "-ac", "2",
+         str(out_path)],
+        check=True
+    )
+
+
+def get_castle_token() -> str:
+    """Read the Castle CLI's saved login token from ~/.castle/config.json."""
+    config_path = Path.home() / ".castle" / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        token = config.get("token")
+        if token:
+            return token
+    except (OSError, json.JSONDecodeError):
+        pass
+    raise RuntimeError("Castle login token wasn't found. Run: castle login")
+
+
+CASTLE_API_URL = "https://api.castle.xyz/graphql"
+
+
+def upload_audio_file(path: Path) -> dict:
+    """Upload an MP3 to Castle via the uploadAudioFile GraphQL mutation.
+    Returns {"fileId": ..., "url": ...}. Encodes the multipart/form-data
+    request by hand since castletool has no dependency on `requests`."""
+    token = get_castle_token()
+    audio_bytes = path.read_bytes()
+
+    operations = json.dumps({
+        "query": """
+          mutation UploadCastleAudio($file: Upload!) {
+            uploadAudioFile(file: $file) {
+              fileId
+              url
+            }
+          }
+        """,
+        "variables": {"file": None},
+    })
+    field_map = json.dumps({"0": ["variables.file"]})
+
+    boundary = uuid.uuid4().hex
+    parts = []
+
+    def add_field(name: str, value: str):
+        parts.append(
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f'{value}\r\n'.encode("utf-8")
+        )
+
+    add_field("operations", operations)
+    add_field("map", field_map)
+    parts.append(
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="0"; filename="{path.name}"\r\n'
+        f'Content-Type: audio/mpeg\r\n\r\n'.encode("utf-8")
+    )
+    parts.append(audio_bytes)
+    parts.append(f'\r\n--{boundary}--\r\n'.encode("utf-8"))
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        CASTLE_API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-OS": "cli",
+            "X-CLI-API-Version": "4",
+            "X-Scene-Creator-Version": "latest",
+            "X-Auth-Token": token,
+            "Apollo-Require-Preflight": "true",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            response_text = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        response_text = e.read().decode("utf-8", errors="replace")
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Castle returned HTTP {e.code}:\n{response_text[:500]}")
+        raise RuntimeError(f"Castle returned HTTP {e.code}:\n{json.dumps(result, indent=2)}")
+
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Castle returned a non-JSON response:\n{response_text[:500]}")
+
+    if result.get("error", {}).get("message"):
+        raise RuntimeError(result["error"]["message"])
+    if result.get("errors"):
+        raise RuntimeError("\n".join(err["message"] for err in result["errors"]))
+
+    uploaded = (result.get("data") or {}).get("uploadAudioFile")
+    if not uploaded or not uploaded.get("url"):
+        raise RuntimeError(f"Castle returned no audio URL:\n{json.dumps(result, indent=2)}")
+    return uploaded
+
+
+def create_audio_rule(upload_url: str) -> dict:
+    """A Rules-component rule that plays an uploaded sound on create and
+    loops it forever (mirrors Castle's own "play on create + loop" pattern)."""
+    return {
+        "trigger": {"name": "create", "behaviorId": 16, "params": {}},
+        "response": {
+            "name": "infinite repeat",
+            "behaviorId": 16,
+            "params": {
+                "interval": 0.01666,
+                "body": {
+                    "name": "play sound",
+                    "behaviorId": 16,
+                    "params": {
+                        "type": "library",
+                        "playbackRate": 1, "amplitude": 1, "pan": 0,
+                        "recordingUrl": "", "uploadUrl": upload_url,
+                        "category": "random", "seed": 1337,
+                        "mutationSeed": 0, "mutationAmount": 5,
+                        "midiNote": 60, "waveform": "square",
+                        "attack": 0, "release": 0.4, "wait": True,
+                    },
+                },
+            },
+        },
+    }
+
+
+def is_audio_loop_rule(rule: dict) -> bool:
+    return (
+        rule.get("trigger", {}).get("name") == "create"
+        and rule.get("response", {}).get("name") == "infinite repeat"
+        and rule.get("response", {}).get("params", {}).get("body", {}).get("name") == "play sound"
+    )
+
+
+def add_or_replace_audio_rule(actor: dict, upload_url: str):
+    components = actor["actorBlueprint"]["components"]
+    rules_component = components.setdefault("Rules", {"rules": [], "disabled": False})
+    rules_component.setdefault("rules", [])
+    rules_component["disabled"] = False
+
+    replacement = create_audio_rule(upload_url)
+    for i, rule in enumerate(rules_component["rules"]):
+        if is_audio_loop_rule(rule):
+            rules_component["rules"][i] = replacement
+            break
+    else:
+        rules_component["rules"].append(replacement)
 
 
 def quantize_frame(png_bytes: bytes, colors: int) -> bytes:
@@ -1553,6 +1725,25 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
         ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px")
 
     actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+
+    if is_video and probe_has_audio(img_path):
+        p()
+        if yn("This video has audio. Upload it and play it with the actor?", default="y"):
+            tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-audio-"))
+            audio_path = tmp_dir / "audio.mp3"
+            try:
+                pb("Extracting audio...")
+                extract_audio_mp3(img_path, audio_path)
+                pb("Uploading audio to Castle...")
+                uploaded = upload_audio_file(audio_path)
+                add_or_replace_audio_rule(actor, uploaded["url"])
+                ps(f"Audio added: {uploaded['url']}")
+            except Exception as e:
+                pe(f"Audio upload failed: {e}")
+                pw("Continuing with silent video.")
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     with open(bp_path, "w", encoding="utf-8") as f:
         json.dump(actor, f, indent=2)
     ps("Image added.")
