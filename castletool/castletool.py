@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.4.6"
+CURRENT_VERSION = "0.4.7"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
