@@ -135,17 +135,23 @@ def ask_path(prompt, default=None, search_dir: Path | None = None):
         p(); sys.exit(0)
     return val if val else (default or "")
 
+_HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+
 def ask_color(prompt: str, default=(0, 0, 0)) -> list:
-    """Ask for an RGB color (0-255 per channel). Returns [r, g, b, 1] as 0-1 floats."""
+    """Ask for a color as RGB (0-255 each) or hex (#rrggbb). Returns [r, g, b, 1] as 0-1 floats."""
     while True:
-        raw = ask(f"{prompt} (R G B, 0-255 each)",
-                   default=f"{default[0]} {default[1]} {default[2]}")
+        raw = ask(f"{prompt} (R G B 0-255, or hex #rrggbb)",
+                   default=f"{default[0]} {default[1]} {default[2]}").strip()
+        if _HEX_COLOR_RE.match(raw):
+            hex_str = raw.lstrip("#")
+            r, g, b = (int(hex_str[i:i+2], 16) / 255 for i in (0, 2, 4))
+            return [round(r, 5), round(g, 5), round(b, 5), 1]
         parts = raw.replace(",", " ").split()
         if len(parts) == 3 and all(p.isdigit() for p in parts) and \
            all(0 <= int(p) <= 255 for p in parts):
             r, g, b = (int(p) / 255 for p in parts)
             return [round(r, 5), round(g, 5), round(b, 5), 1]
-        pe("Enter three numbers 0-255, e.g. 255 0 128")
+        pe("Enter three numbers 0-255 (e.g. 255 0 128) or hex (e.g. #ff0080)")
 
 
 # ── character/codepoint spec parsing (shared by basic + advanced font UI) ────
