@@ -63,8 +63,8 @@ yourself, either typed directly or loaded from a file:
 
 - Plain characters are typed as-is: `0123456789ABCDEF`.
 - A specific codepoint is written `U+XXXX` (hex): `U+03A9` is Ω.
-- Separate every `U+XXXX` codepoint with a space something like `U+03A9U+0021` is invalid.
-- Any character or codepoint used twice is is rejected.
+- Separate every `U+XXXX` codepoint with a space. Something like `U+03A9U+0021` is invalid.
+- Any character or codepoint used twice is rejected.
 
 Loading from a file uses the same rules, plus:
 - Newlines are ignored
