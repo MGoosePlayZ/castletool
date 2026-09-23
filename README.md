@@ -1,4 +1,8 @@
 # castletool
+[![PyPI Version](https://img.shields.io/pypi/v/castletool.svg)](https://pypi.org/project/castletool/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/castletool.svg)](https://pypi.org/project/castletool/)
+[![Downloads](https://img.shields.io/pypi/dm/castletool.svg)](https://pypistats.org/packages/castletool)
+[![License](https://img.shields.io/github/license/MGoosePlayZ/castletool.svg)](https://github.com/MGoosePlayZ/castletool)
 
 Castletool is a terminal tool for injecting files into Castle decks You can inject full color images, GIFs, videos, SVGs, MIDI music, and fonts. (Not affiliated with Monterey's Coast, Inc.)
 
