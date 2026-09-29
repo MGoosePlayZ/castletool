@@ -6,7 +6,7 @@
 
 Castletool is a terminal tool for injecting files into Castle decks You can inject full color images, GIFs, videos, SVGs, MIDI music, and fonts. (Not affiliated with Monterey's Coast, Inc.)
 
-### Installation
+## Installation
 
 ```
 pip install castletool
@@ -14,7 +14,7 @@ pip install castletool
 
 Requires Python 3.10+ and the [Castle CLI](https://docs.castle.xyz/docs/cli) logged in for deck uploads to work.
 
-### Usage
+## Usage
 
 Run `castletool` from inside (or above) a folder containing your Castle
 deck(s), and follow the prompts. `cd` into where your decks are located (usually `~/decks`) if it says it can't find any.
@@ -28,7 +28,7 @@ Either way, it works the same way: pick a **deck**, then a **card**, then a **bl
 
 `castletool --version` (or `-v`) prints the installed version.
 
-### What you can do
+## What you can do
 
 - **Add image** — bitmap images, animated GIF/WEBP/APNG, video (via ffmpeg), and SVG are all supported. Raster images are scaled with nearest-neighbor (no color blending, stays crisp for pixel art). Optional per-frame quantizing and "keep every Nth frame" thinning if you're pushing Castle's size limit.
 - **Add MIDI** — converts a MIDI file into a Castle `Music` component and syncs the card's tempo to match.
@@ -36,7 +36,7 @@ Either way, it works the same way: pick a **deck**, then a **card**, then a **bl
 - **Edit Background Color** — sets the card's background color.
 - **Upload Deck** — runs `castle save-deck` on the current deck.
 
-### Add Font: Basic vs Advanced mode
+## Add Font: Basic vs Advanced mode
 
 **Basic mode** gives you a list of preset unicode ranges select as many as you want:
 
@@ -70,7 +70,7 @@ Loading from a file uses the same rules, plus:
 - Newlines are ignored
 - `--` starts a comment that runs to the end of the line.
 
-### FAQ
+## FAQ
 
 Q: It says I don't have any decks, what do I do?
 
@@ -99,3 +99,13 @@ A: You are probably running the command while in a different directory. `cd` int
 Q: Add Font says a character set/file has no matches, or skipped some characters — why?
 
 A: Not every font implements every unicode block. Codepoints the font has no glyph for are skipped automatically (you'll get a warning listing how many).
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=mgooseplayz%2Fcastletool&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mgooseplayz/castletool&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mgooseplayz/castletool&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mgooseplayz/castletool&type=date&legend=top-left" />
+ </picture>
+</a>
