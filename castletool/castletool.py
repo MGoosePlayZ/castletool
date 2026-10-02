@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.4.7"
+CURRENT_VERSION = "0.4.9"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -339,14 +339,77 @@ def check_for_update(include_prereleases: bool | None = None):
     if _version_tuple(latest) > _version_tuple(current):
         pw(f"A newer version is available: {latest} (you have {current})")
         if yn("Install it now?"):
-            pip_argv = [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"]
+            pip_argv = [sys.executable, "-m", "pip", "install", "--upgrade"]
             if include_prereleases:
                 pip_argv.append("--pre")
             pip_argv.append("castletool")
-            subprocess.run(pip_argv)
-            ps("Updated! Please restart Castletool.")
-            sys.exit(0)
-        p()
+
+            if os.name == "nt":
+                # On Windows the running process (castletool.exe and its
+                # imported modules) holds the files pip needs to replace,
+                # so an in-process "pip install --upgrade castletool" can
+                # partially delete/replace the package out from under
+                # itself. Spawn a detached helper that waits for this PID
+                # to exit before upgrading, so the files are unlocked
+                # first.
+                if _windows_deferred_update(pip_argv):
+                    ps("Update will install after Castletool closes.")
+                    sys.exit(0)
+                else:
+                    pw(
+                        "Failed to automatically install, please run: "
+                        + " ".join(pip_argv)
+                    )
+                    p()
+            else:
+                result = subprocess.run(pip_argv, capture_output=True, text=True)
+                if result.returncode == 0:
+                    ps("Updated! Please restart Castletool.")
+                    sys.exit(0)
+                else:
+                    err = (result.stderr or result.stdout or "").strip()
+                    pw(f"Update failed{(': ' + err) if err else ''}.")
+                    p()
+        else:
+            p()
+
+
+def _windows_deferred_update(pip_argv: list[str]) -> bool:
+    """Spawn a detached helper that waits for this process to exit, then
+    runs the upgrade. Returns True if the helper was launched, False if it
+    could not be (caller should fall back to a manual-install message).
+    """
+    try:
+        helper = (
+            "import subprocess,sys,time\n"
+            "pid=int(sys.argv[1])\n"
+            "argv=sys.argv[2:]\n"
+            "while True:\n"
+            "    try:\n"
+            "        subprocess.run(['tasklist','/FI',f'PID eq {pid}'],"
+            " capture_output=True, text=True, check=True).stdout\n"
+            "    except Exception:\n"
+            "        break\n"
+            "    out=subprocess.run(['tasklist','/FI',f'PID eq {pid}'],"
+            " capture_output=True, text=True).stdout\n"
+            "    if str(pid) not in out:\n"
+            "        break\n"
+            "    time.sleep(1)\n"
+            "subprocess.run(argv)\n"
+        )
+        helper_path = Path(tempfile.gettempdir()) / "castletool_update_helper.py"
+        helper_path.write_text(helper, encoding="utf-8")
+
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [sys.executable, str(helper_path), str(os.getpid()), *pip_argv],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
 
 # ── dependency auto-install ──────────────────────────────────────────────────
 
