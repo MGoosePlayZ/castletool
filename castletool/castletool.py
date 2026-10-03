@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.4.9"
+CURRENT_VERSION = "0.5.1"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -1974,7 +1974,35 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
 
 
+def _minify_deck_json(deck: Path) -> None:
+    """Rewrite every .json file under the deck without insignificant
+    whitespace. Best-effort and silent: a file that can't be read or parsed
+    is left exactly as it was, and each rewrite is atomic."""
+    for root, dirs, files in os.walk(deck):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if not name.lower().endswith(".json"):
+                continue
+            path = Path(root) / name
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                original = path.read_text(encoding="utf-8-sig")
+                compact = json.dumps(json.loads(original),
+                                     separators=(",", ":"),
+                                     ensure_ascii=False)
+                if compact == original:
+                    continue
+                tmp.write_text(compact, encoding="utf-8", newline="")
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+
 def do_upload_deck(deck: Path):
+    _minify_deck_json(deck)
     castle_argv = ["castle", "save-deck", str(deck)]
     if os.name == "nt":
         # On Windows, CreateProcess (used when shell=False) only tries
