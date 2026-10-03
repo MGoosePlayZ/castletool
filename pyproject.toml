@@ -1,37 +1,53 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "castletool"
 version = "0.4.91"
-description = "Interactive Castle deck editor for injecting images/GIFs/video/SVG, MIDI music, and vector-rendered fonts into Castle blueprint JSON files."
-authors = [
-    { name = "MGoosePlayZ", email = "juniorboy62011@gmail.com" }
-]
+description = "Interactive Castle deck editor: inject images, animated GIF/WEBP/APNG, video with sound, SVG, MIDI music and vector-rendered fonts into Castle blueprints, set card backgrounds, and upload decks, via a tap/click TUI or a classic CLI."
 readme = "README.md"
+authors = [
+    { name = "MGoosePlayZ" },
+]
+license = "Unlicense"
+license-files = ["LICENSE"]
+keywords = [
+    "castle", "castle.xyz", "deck", "blueprint", "tui", "cli",
+    "gif", "svg", "midi", "font", "video", "image",
+]
 requires-python = ">=3.10"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Multimedia :: Sound/Audio :: MIDI",
+    "Topic :: Utilities",
 ]
 
-# Standard dependencies (empty by default to match your try/except logic,
-# except textual, which the default `castletool` command needs just to start)
-dependencies = ["textual>=0.65.0"]
-
-[project.optional-dependencies]
-# Users can install these by running: pip install castletool[all]
-all = [
-    "Pillow>=9.0.0",
+dependencies = [
+    "textual>=0.65.0",
+    "rich>=13.3.3",
+    "Pillow>=9.1.0",
     "mido>=1.2.10",
-    "fonttools>=4.0.0"
+    "fonttools>=4.0.0",
 ]
+
+[project.urls]
+Homepage = "https://pypi.org/project/castletool/"
+Repository = "https://github.com/MGoosePlayZ/castletool"
+Issues = "https://github.com/MGoosePlayZ/castletool/issues"
 
 [project.scripts]
-# Opens the tap/click TUI by default; pass --cli for the classic typing-based CLI
 castletool = "castletool.tui:main"
 castletool-tui = "castletool.tui:main"
 castletool-cli = "castletool.castletool:main"
