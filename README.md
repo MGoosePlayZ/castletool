@@ -3,6 +3,8 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/castletool.svg)](https://pypi.org/project/castletool/)
 [![Downloads](https://img.shields.io/pypi/dm/castletool.svg)](https://pypistats.org/packages/castletool)
 [![License](https://img.shields.io/github/license/MGoosePlayZ/castletool.svg)](https://github.com/MGoosePlayZ/castletool)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/MGoosePlayZ/castletool/python-publish.yml)](https://github.com/MGoosePlayZ/castletool)
+
 
 Images, vector graphics, videos, audio. You name it, castletool (probably) supports it.
 
