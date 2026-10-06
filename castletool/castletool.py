@@ -27,7 +27,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.5.8"
+CURRENT_VERSION = "0.6.0a1"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -536,7 +536,11 @@ def set_card_tempo(card: Path, bpm: float):
 
 # ── image/gif → Drawing2 ─────────────────────────────────────────────────────
 
-def load_image_frames(path: Path, width: int, height: int, ico_size=None):
+def load_image_frames(path: Path, width: int, height: int, ico_size=None,
+                      smooth: bool = False):
+    """Decode an image (or every frame of an animation) as PNG bytes resized to
+    width×height. `smooth` = bilinear interpolation; off = crisp nearest-neighbor."""
+    resample = Image.BILINEAR if smooth else Image.NEAREST
     img = Image.open(path)
     if ico_size:
         # .ico files embed several resolutions; select one before decoding.
@@ -544,7 +548,7 @@ def load_image_frames(path: Path, width: int, height: int, ico_size=None):
 
     # Normal image
     if not getattr(img, "is_animated", False):
-        frame = img.convert("RGBA").resize((width, height), Image.NEAREST)
+        frame = img.convert("RGBA").resize((width, height), resample)
         buf = io.BytesIO()
         frame.save(buf, format="PNG")
         return [buf.getvalue()], 1.0
@@ -555,7 +559,7 @@ def load_image_frames(path: Path, width: int, height: int, ico_size=None):
 
     try:
         while True:
-            frame = img.convert("RGBA").resize((width, height), Image.NEAREST)
+            frame = img.convert("RGBA").resize((width, height), resample)
             buf = io.BytesIO()
             frame.save(buf, format="PNG")
             frames.append(buf.getvalue())
@@ -585,7 +589,8 @@ def probe_video_dimensions(path: Path) -> tuple[int, int]:
         return 64, 64
 
 
-def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1) -> tuple[list[bytes], float]:
+def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1,
+                       smooth: bool = False) -> tuple[list[bytes], float]:
     """Extract frames from MP4 using ffmpeg. Returns (png_frames, fps)."""
     if not HAS_FFMPEG:
         pe("ffmpeg not found. Install with: pkg install ffmpeg")
@@ -609,10 +614,11 @@ def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1) ->
 
     # Extract frames as PNG via pipe. width/height already share the source's
     # aspect ratio (scaled), so a plain nearest-neighbor scale is exact — no
-    # padding/cropping needed.
+    # padding/cropping needed. `smooth` swaps nearest-neighbor for bilinear.
+    scale_flags = "bilinear" if smooth else "neighbor"
     result = subprocess.run(
         ["ffmpeg", "-i", str(path),
-         "-vf", f"select='not(mod(n\\,{every_n}))',scale={width}:{height}:flags=neighbor",
+         "-vf", f"select='not(mod(n\\,{every_n}))',scale={width}:{height}:flags={scale_flags}",
          "-vsync", "vfr",
          "-f", "image2pipe", "-vcodec", "png", "-"],
         capture_output=True
@@ -891,28 +897,33 @@ def build_drawing2(
     fps: float,
     width: int,
     height: int,
-    play_mode: str = "loop"
+    play_mode: str = "loop",
+    sizes: list[tuple[int, int]] | None = None,
+    scale: int | None = None,
 ) -> dict:
+    """width/height is the overall (largest) size. `sizes` gives each frame's
+    own pixel size when they differ; `scale` pins pixels-per-unit instead of
+    deriving it from width/height (so several drawings share one density)."""
     # Empirical scale formula
-    scale = max(1, round(max(width, height) / 20))
+    if scale is None:
+        scale = max(1, round(max(width, height) / 20))
+
+    def _bounds(w, h):
+        return {"minX": -w / 2, "maxX": w / 2, "minY": -h / 2, "maxY": h / 2}
 
     half_w, half_h = width / 2, height / 2
-    bounds = {
-        "minX": -half_w,
-        "maxX": half_w,
-        "minY": -half_h,
-        "maxY": half_h,
-}
+    bounds = _bounds(width, height)
+    frame_bounds = [_bounds(w, h) for w, h in sizes] if sizes else [bounds] * len(frames)
 
     castle_frames = [{
         "isLinked": False,
         "pathDataList": [],
-        "fillImageBounds": bounds,
+        "fillImageBounds": fb,
         "fillPng": base64.b64encode(p).decode(),
         "avatarX": 0,
         "avatarY": 0,
         "avatarRadius": 5,
-} for p in frames]
+} for p, fb in zip(frames, frame_bounds)]
 
     return {
         "initialFrame": 1,
@@ -934,7 +945,7 @@ def build_drawing2(
             "version": 3,
             "fillPixelsPerUnit": scale,
             "numTotalLayers": 1,
-            "framesBounds": [bounds] * len(frames),
+            "framesBounds": frame_bounds,
             "colors": [],
             "selectedFrame": 1,
             "layers": [{
@@ -1206,36 +1217,252 @@ def parse_svg_color(s: str, opacity: float = 1.0):
         return [*c, opacity] if c else None
     if s.startswith("#"):
         h = s[1:]
-        if len(h) == 3: h = h[0]*2+h[1]*2+h[2]*2
-        r,g,b = int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+        if len(h) in (3, 4): h = "".join(ch * 2 for ch in h)
+        try:
+            r,g,b = int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+            if len(h) == 8: opacity *= int(h[6:8],16)/255
+        except ValueError:
+            return [0, 0, 0, opacity]
         return [r, g, b, opacity]
     m = re.match(r'rgb\((\d+),\s*(\d+),\s*(\d+)\)', s)
     if m:
         return [int(m.group(i))/255 for i in (1,2,3)] + [opacity]
-    return [0, 0, 0, opacity]
+    try:
+        # every CSS color name, hsl(), rgb(%) ...
+        from PIL import ImageColor
+        r, g, b = ImageColor.getrgb(s)[:3]
+        return [r/255, g/255, b/255, opacity]
+    except Exception:
+        return [0, 0, 0, opacity]
+
+
+# ── SVG style helpers (shared by the vector and bitmap SVG paths) ────────────
+# Colors can come from attributes or inline `style`, and are inherited from
+# parent groups. Not handled: <style> blocks/classes, gradients, transforms.
+
+_UNSET = object()   # "this SVG never says what color to use"
+_SVG_SHAPES = {"path", "line", "polyline", "polygon", "rect", "circle", "ellipse"}
+_SVG_HIDDEN = {"defs", "clippath", "mask", "symbol", "pattern", "marker", "metadata",
+               "title", "desc", "style", "script", "lineargradient", "radialgradient",
+               "filter"}
+_SVG_STYLE_KEYS = ("fill", "stroke", "stroke-width", "stroke-opacity",
+                   "fill-opacity", "fill-rule", "color")
+
+
+def _svg_tag(el) -> str:
+    return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+
+def _svg_style(el, inherited: dict) -> dict:
+    """Computed style for `el`: inherited values, overridden by attributes,
+    overridden by the inline style=\"...\" declarations."""
+    props = {}
+    for k in _SVG_STYLE_KEYS + ("opacity", "display"):
+        v = el.get(k)
+        if v is not None:
+            props[k] = v.strip()
+    for decl in (el.get("style") or "").split(";"):
+        if ":" in decl:
+            k, v = decl.split(":", 1)
+            props[k.strip().lower()] = v.strip()
+    st = dict(inherited)
+    for k in _SVG_STYLE_KEYS:
+        if k in props and props[k].lower() != "inherit":
+            st[k] = props[k]
+    try:
+        own_opacity = float(props.get("opacity", 1))
+    except ValueError:
+        own_opacity = 1.0
+    st["_opacity"] = inherited.get("_opacity", 1.0) * own_opacity
+    if props.get("display", "").lower() == "none":
+        st["_hidden"] = True
+    return st
+
+
+def _svg_walk(el, inherited=None, skip_hidden=False):
+    """Yield (element, tag, computed_style) for el and every descendant."""
+    st = _svg_style(el, inherited or {"_opacity": 1.0})
+    t = _svg_tag(el)
+    if skip_hidden and (t.lower() in _SVG_HIDDEN or st.get("_hidden")):
+        return
+    yield el, t, st
+    for child in el:
+        yield from _svg_walk(child, st, skip_hidden)
+
+
+def _svg_paint(st: dict, kind: str):
+    """Resolve fill/stroke to [r,g,b,a], None (explicitly none), or _UNSET."""
+    raw = st.get(kind)
+    if raw is None:
+        return _UNSET
+    raw = raw.strip().lower()
+    if raw in ("", "inherit") or raw.startswith("url("):
+        return _UNSET
+    if raw == "none":
+        return None
+    if raw == "currentcolor":
+        raw = (st.get("color") or "").strip().lower()
+        if not raw or raw == "currentcolor":
+            return _UNSET
+    try:
+        opacity = float(st.get(kind + "-opacity", 1))
+    except ValueError:
+        opacity = 1.0
+    c = parse_svg_color(raw, opacity * st.get("_opacity", 1.0))
+    return c if c else None
+
+
+def _svg_num(s, default: float = 0.0) -> float:
+    m = re.match(r"\s*(-?\d*\.?\d+(?:[eE][-+]?\d+)?)", s or "")
+    return float(m.group(1)) if m else default
+
+
+def _svg_dims(root) -> tuple[float, float, float, float]:
+    """(x, y, width, height) of the SVG's drawing area in user units."""
+    vb = root.get("viewBox")
+    if vb:
+        parts = _svg_parse_numbers(vb)
+        if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+            return tuple(parts)
+    w = _svg_num(root.get("width"), 100.0)
+    h = _svg_num(root.get("height"), 100.0)
+    return 0.0, 0.0, (w if w > 0 else 100.0), (h if h > 0 else 100.0)
+
+
+def _svg_element_polylines(el, t: str, steps: int) -> list[list[tuple]]:
+    """Flatten one basic shape into polylines of (x, y) in SVG user units."""
+    g = lambda key, default=0.0: _svg_num(el.get(key), default)
+    if t == "path":
+        return _svg_path_to_polylines(el.get("d", ""), steps)
+    if t == "line":
+        return [[(g("x1"), g("y1")), (g("x2"), g("y2"))]]
+    if t in ("polyline", "polygon"):
+        raw = _svg_parse_numbers(el.get("points", ""))
+        pts = [(raw[i], raw[i + 1]) for i in range(0, len(raw) - 1, 2)]
+        if t == "polygon" and pts:
+            pts.append(pts[0])
+        return [pts]
+    if t == "rect":
+        x, y, w, h = g("x"), g("y"), g("width"), g("height")
+        return [[(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]]
+    if t in ("circle", "ellipse"):
+        cx, cy = g("cx"), g("cy")
+        rx, ry = (g("r", 1.0), g("r", 1.0)) if t == "circle" else (g("rx", 1.0), g("ry", 1.0))
+        return [[(cx + rx * math.cos(2 * math.pi * i / steps),
+                  cy + ry * math.sin(2 * math.pi * i / steps)) for i in range(steps + 1)]]
+    return []
+
+
+def svg_needs_fallback_color(svg_path, bitmap: bool) -> bool:
+    """True if some shapes never specify a color (so the user should pick one)."""
+    try:
+        root = ET.parse(svg_path).getroot()
+    except Exception:
+        return False
+    for _el, t, st in _svg_walk(root, skip_hidden=bitmap):
+        if t not in _SVG_SHAPES:
+            continue
+        fill, stroke = _svg_paint(st, "fill"), _svg_paint(st, "stroke")
+        if bitmap:
+            if (stroke is _UNSET) if t == "line" else (fill is _UNSET):
+                return True
+        elif fill in (_UNSET, None) and stroke in (_UNSET, None):
+            return True
+    return False
+
+
+def _composite_mask(canvas, mask, rgba):
+    """Paint solid `rgba` through `mask` onto `canvas` (both full size)."""
+    alpha = max(0.0, min(1.0, rgba[3] if len(rgba) > 3 else 1.0))
+    if alpha < 1.0:
+        mask = mask.point(lambda v: int(v * alpha))
+    layer = Image.new("RGBA", canvas.size,
+                      tuple(round(c * 255) for c in rgba[:3]) + (0,))
+    layer.putalpha(mask)
+    return Image.alpha_composite(canvas, layer)
+
+
+def _xor_polygon(mask, poly):
+    """Even-odd fill: toggle the area inside `poly` in `mask` (so holes work)."""
+    from PIL import ImageChops, ImageDraw
+    xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+    x0, y0 = max(0, math.floor(min(xs))), max(0, math.floor(min(ys)))
+    x1, y1 = min(mask.width, math.ceil(max(xs)) + 1), min(mask.height, math.ceil(max(ys)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    layer = Image.new("L", (x1 - x0, y1 - y0), 0)
+    ImageDraw.Draw(layer).polygon([(x - x0, y - y0) for x, y in poly], fill=255)
+    box = (x0, y0, x1, y1)
+    mask.paste(ImageChops.difference(mask.crop(box), layer), box)
+
+
+def rasterize_svg(svg_path, scale: float = 1.0, smooth: bool = False, steps: int = 48,
+                  color=None, fallback_color=None) -> tuple[bytes, int, int]:
+    """Render an SVG to a filled RGBA PNG using its own fill/stroke colors.
+    `color` overrides every color; `fallback_color` is used where the SVG gives
+    none. With `smooth`, edges are anti-aliased (4x supersampling, bilinear
+    downscale); without, they're hard pixels. Returns (png_bytes, w, h)."""
+    from PIL import ImageDraw
+    root = ET.parse(svg_path).getroot()
+    vb_x, vb_y, vb_w, vb_h = _svg_dims(root)
+    width, height = max(1, round(vb_w * scale)), max(1, round(vb_h * scale))
+    if max(width, height) > 4096:
+        raise ValueError(f"SVG would be {width}×{height}px; use a smaller scale")
+    ss = 4 if smooth else 1
+    while ss > 1 and width * height * ss * ss > 36_000_000:
+        ss -= 1
+    canvas = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+    k = scale * ss
+    fallback = fallback_color or [0, 0, 0, 1]
+
+    for el, t, st in _svg_walk(root, skip_hidden=True):
+        if t not in _SVG_SHAPES:
+            continue
+        polys = [[((x - vb_x) * k, (y - vb_y) * k) for x, y in poly]
+                 for poly in _svg_element_polylines(el, t, steps) if len(poly) >= 2]
+        if not polys:
+            continue
+        fill, stroke = _svg_paint(st, "fill"), _svg_paint(st, "stroke")
+        if color:
+            fill = None if fill is None else color
+            stroke = None if stroke in (_UNSET, None) else color
+        else:
+            if fill is _UNSET:
+                fill = None if t == "line" else fallback
+            if stroke is _UNSET:
+                stroke = fallback if t == "line" else None
+
+        if fill is not None and t != "line":
+            mask = Image.new("L", canvas.size, 0)
+            for poly in polys:
+                if len(poly) >= 3:
+                    _xor_polygon(mask, poly)
+            canvas = _composite_mask(canvas, mask, fill)
+        if stroke is not None:
+            line_w = max(1, round(_svg_num(st.get("stroke-width"), 1.0) * k))
+            mask = Image.new("L", canvas.size, 0)
+            draw = ImageDraw.Draw(mask)
+            for poly in polys:
+                draw.line(poly, fill=255, width=line_w, joint="curve")
+            canvas = _composite_mask(canvas, mask, stroke)
+
+    if ss > 1:
+        canvas = canvas.resize((width, height), Image.BILINEAR)
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue(), width, height
 
 
 def svg_to_path_data(svg_path, steps: int = 16, scale: float = 1.0,
-                     ppu: float = SVG_DEFAULT_PPU, color=None):
+                     ppu: float = SVG_DEFAULT_PPU, color=None, fallback_color=None):
     """
     Parse an SVG file and return a Castle pathDataList and framesBounds.
     scale: multiplier applied to Castle units (1.0 = default)
     ppu: pixels per unit (default 25.6)
     color: override color [r,g,b,a], None = use SVG colors
+    fallback_color: color for shapes the SVG doesn't give one (default black)
     """
-    tree = ET.parse(svg_path)
-    root = tree.getroot()
-
-    def tag(el): return el.tag.split('}')[-1] if '}' in el.tag else el.tag
-
-    vb = root.get("viewBox")
-    if vb:
-        parts = _svg_parse_numbers(vb)
-        vb_x, vb_y, vb_w, vb_h = parts
-    else:
-        vb_x, vb_y = 0, 0
-        vb_w = float(root.get("width", 100))
-        vb_h = float(root.get("height", 100))
+    root = ET.parse(svg_path).getroot()
 
     # SVG Y is flipped vs Castle Y
     def to_castle_raw(x, y):
@@ -1249,59 +1476,21 @@ def svg_to_path_data(svg_path, steps: int = 16, scale: float = 1.0,
         return (rx - _cx_offset[0], ry - _cy_offset[0])
 
     path_data = []
-    default_color = color or [0, 0, 0, 1]
+    default_color = fallback_color or [0, 0, 0, 1]
     all_xs, all_ys = [], []
 
-    def get_color(el):
+    def get_color(st):
         if color: return color
-        stroke = el.get("stroke") or el.get("style", "")
-        m = re.search(r'stroke\s*:\s*([^;]+)', stroke)
-        stroke_val = m.group(1).strip() if m else (el.get("stroke") or "black")
-        op_m = re.search(r'stroke-opacity\s*:\s*([^;]+)', el.get("style",""))
-        opacity = float(op_m.group(1)) if op_m else float(el.get("stroke-opacity", 1))
-        c = parse_svg_color(stroke_val, opacity)
-        return c if c else default_color
+        # Lines are drawn as outlines: prefer the stroke color, then the fill.
+        for kind in ("stroke", "fill"):
+            c = _svg_paint(st, kind)
+            if c is not _UNSET and c is not None:
+                return c
+        return default_color
 
-    def process_element(el):
-        t = tag(el)
-        c = get_color(el)
-
-        polylines = []
-
-        if t == "path":
-            d = el.get("d", "")
-            polylines = _svg_path_to_polylines(d, steps)
-
-        elif t == "line":
-            x1,y1 = float(el.get("x1",0)), float(el.get("y1",0))
-            x2,y2 = float(el.get("x2",0)), float(el.get("y2",0))
-            polylines = [[(x1,y1),(x2,y2)]]
-
-        elif t == "polyline" or t == "polygon":
-            pts_raw = _svg_parse_numbers(el.get("points",""))
-            pts = [(pts_raw[i],pts_raw[i+1]) for i in range(0,len(pts_raw)-1,2)]
-            if t == "polygon" and pts: pts.append(pts[0])
-            polylines = [pts]
-
-        elif t == "rect":
-            x,y = float(el.get("x",0)), float(el.get("y",0))
-            w,h = float(el.get("width",0)), float(el.get("height",0))
-            polylines = [[(x,y),(x+w,y),(x+w,y+h),(x,y+h),(x,y)]]
-
-        elif t == "circle":
-            cx2,cy2,r = float(el.get("cx",0)),float(el.get("cy",0)),float(el.get("r",1))
-            pts = [(cx2+r*math.cos(2*math.pi*i/steps),
-                    cy2+r*math.sin(2*math.pi*i/steps)) for i in range(steps+1)]
-            polylines = [pts]
-
-        elif t == "ellipse":
-            cx2,cy2 = float(el.get("cx",0)),float(el.get("cy",0))
-            rx2,ry2 = float(el.get("rx",1)),float(el.get("ry",1))
-            pts = [(cx2+rx2*math.cos(2*math.pi*i/steps),
-                    cy2+ry2*math.sin(2*math.pi*i/steps)) for i in range(steps+1)]
-            polylines = [pts]
-
-        for poly in polylines:
+    for el, t, st in _svg_walk(root):
+        c = get_color(st)
+        for poly in _svg_element_polylines(el, t, steps):
             if len(poly) < 2: continue
             castle_pts = [to_castle(x, y) for x, y in poly]
             for j in range(len(castle_pts)-1):
@@ -1315,11 +1504,6 @@ def svg_to_path_data(svg_path, steps: int = 16, scale: float = 1.0,
                 })
                 all_xs.extend([x1, x2])
                 all_ys.extend([y1, y2])
-
-        for child in el:
-            process_element(child)
-
-    process_element(root)
 
     if not all_xs:
         return path_data, {"minX":-5,"maxX":5,"minY":-5,"maxY":5}, {"minX":-32,"maxX":32,"minY":-32,"maxY":32}
@@ -2092,41 +2276,74 @@ def attach_audio(actor: dict, src: Path, is_video: bool) -> bool:
 
 # ── image / animation / video / vector → Drawing2 ────────────────────────────
 
-def prompt_visual_settings(cat: str, files: list[Path], multi: bool) -> dict:
-    """Ask the processing questions once; they apply to every file."""
+SMOOTH_PROMPT = ("Enable bilinear interpolation? "
+                 "(smooth scaling/edges instead of crisp pixels)")
+
+
+def _ask_scale(prompt: str, default: str = "1") -> float:
+    raw = ask(prompt, default=default)
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        pw("Invalid scale, using 1.")
+        return 1.0
+
+
+def prompt_visual_settings(cat: str, files: list[Path], multi: bool,
+                           no_scale: bool = False, resizes: bool = False) -> dict:
+    """Ask the processing questions once; they apply to every file.
+    no_scale: still-image archive set to "don't scale" (1 pixel = 1 pixel).
+    resizes: images get resized even at scale 1 (archive frames fitted to the
+    first image), so the interpolation question is still relevant."""
     st = {"scale": 1.0, "every": 1, "quantize": 0,
-          "svg_scale": 1.0, "steps": 16, "color": None}
+          "svg_scale": 1.0, "steps": 16, "color": None,
+          "smooth": False, "bitmap": False, "fallback_color": None,
+          "no_scale": no_scale, "fixed_scale": None}
     note = " (applies to every file)" if multi else ""
     p()
 
     if cat == "vector":
-        if yn("Would you like to scale the SVG output?" + note, default="n"):
-            while True:
-                raw = ask("Enter scale multiplier (e.g. 2.0 = twice as large)", default="1.0")
-                try:
-                    st["svg_scale"] = float(raw)
-                    break
-                except ValueError:
-                    pe("Enter a number like 1.0 or 0.5")
-        if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
-            while True:
-                raw = ask("Steps per curve segment", default="16")
-                if raw.isdigit() and int(raw) >= 2:
-                    st["steps"] = int(raw)
-                    break
-                pe("Enter a number ≥ 2")
+        style = choose("How should the SVG be drawn?" + note, [
+            "Vector (line segments)",
+            "Bitmap (filled in, keeps its colors)",
+        ])
+        st["bitmap"] = style.startswith("Bitmap")
+        if st["bitmap"]:
+            st["scale"] = _ask_scale("Scale (1 = the SVG's own size in pixels, 2 = double)")
+            st["smooth"] = yn(SMOOTH_PROMPT, default="n")
+        else:
+            if yn("Would you like to scale the SVG output?" + note, default="n"):
+                while True:
+                    raw = ask("Enter scale multiplier (e.g. 2.0 = twice as large)", default="1.0")
+                    try:
+                        st["svg_scale"] = float(raw)
+                        break
+                    except ValueError:
+                        pe("Enter a number like 1.0 or 0.5")
+            if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
+                while True:
+                    raw = ask("Steps per curve segment", default="16")
+                    if raw.isdigit() and int(raw) >= 2:
+                        st["steps"] = int(raw)
+                        break
+                    pe("Enter a number ≥ 2")
+        # Use the SVG's own colors; only ask where it doesn't say.
         if yn("Override the SVG's own colors with a single custom color?", default="n"):
             st["color"] = ask_color("Enter override color")
-        return st
-
-    raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)" + note, default="1")
-    try:
-        st["scale"] = float(raw)
-        if st["scale"] <= 0:
-            raise ValueError
-    except ValueError:
-        pw("Invalid scale, using 1.")
-        st["scale"] = 1.0
+        elif any(svg_needs_fallback_color(f, st["bitmap"]) for f in files):
+            p("Some shapes in the SVG don't specify a color.")
+            st["fallback_color"] = ask_color("Pick a color for them")
+        if not st["bitmap"]:
+            return st
+    elif no_scale:
+        p("Images keep their original size (1 pixel = 1 pixel).")
+    else:
+        st["scale"] = _ask_scale("Scale (1 = full resolution, 0.5 = half, 2 = double)" + note)
+        if st["scale"] != 1.0 or resizes:
+            st["smooth"] = yn(SMOOTH_PROMPT, default="n")
 
     if cat in ("animation", "video"):
         p()
@@ -2167,21 +2384,50 @@ def scaled_size(native: tuple[int, int], scale: float) -> tuple[int, int]:
     return max(1, round(native[0] * scale)), max(1, round(native[1] * scale))
 
 
+def fixed_density_scale(files: list[Path], ico_sizes: dict) -> int | None:
+    """One pixels-per-unit for a whole batch, sized so the LARGEST image looks
+    as it normally would. Every image then shares the same pixel size."""
+    dims = []
+    for f in files:
+        try:
+            dims.append(visual_native_size(f, "image", ico_sizes.get(f)))
+        except Exception:
+            pass
+    if not dims:
+        return None
+    return max(1, round(max(max(d) for d in dims) / 20))
+
+
 def render_visual(path: Path, cat: str, st: dict, ico_size=None):
     """Convert one file into a Drawing2 component. Returns (drawing2, summary)."""
+    if cat == "vector" and st["bitmap"]:
+        pb(f"Rasterizing SVG: {path.name}")
+        png, width, height = rasterize_svg(
+            path, scale=st["scale"], smooth=st["smooth"],
+            color=st["color"], fallback_color=st["fallback_color"])
+        frames = [png]
+        if st["quantize"]:
+            pb(f"Quantizing to {st['quantize']} colors...")
+            frames = [quantize_frame(f, st["quantize"]) for f in frames]
+        drawing2 = build_drawing2(frames, 1.0, width, height, "still")
+        return drawing2, f"SVG ready: bitmap, {width}×{height}px"
+
     if cat == "vector":
         pb(f"Loading SVG: {path.name}")
         path_data, bounds, fill_bounds = svg_to_path_data(
-            path, steps=st["steps"], scale=st["svg_scale"], color=st["color"])
+            path, steps=st["steps"], scale=st["svg_scale"], color=st["color"],
+            fallback_color=st["fallback_color"])
         drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
         return drawing2, f"SVG ready: {len(path_data)} line segments"
 
     width, height = scaled_size(visual_native_size(path, cat, ico_size), st["scale"])
     pb(f"Loading {'video' if cat == 'video' else 'image'}: {path.name}")
     if cat == "video":
-        frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"])
+        frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"],
+                                         smooth=st["smooth"])
     else:
-        frames, fps = load_image_frames(path, width, height, ico_size=ico_size)
+        frames, fps = load_image_frames(path, width, height, ico_size=ico_size,
+                                        smooth=st["smooth"])
         if st["every"] > 1:
             frames = frames[::st["every"]]
             fps = fps / st["every"]
@@ -2189,27 +2435,45 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
         frames = [quantize_frame(f, st["quantize"]) for f in frames]
     play_mode = "loop" if (cat in ("animation", "video") or len(frames) > 1) else "still"
-    drawing2 = build_drawing2(frames, fps, width, height, play_mode)
+    drawing2 = build_drawing2(frames, fps, width, height, play_mode,
+                              scale=st["fixed_scale"])
     return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px"
 
 
 def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float):
-    """Several still images → ONE Drawing2 with one frame per image. Every
-    frame is sized like the first image (scaled)."""
-    first = files[0]
-    width, height = scaled_size(
-        visual_native_size(first, "image", ico_sizes.get(first)), st["scale"])
+    """Several still images → ONE Drawing2 with one frame per image.
+    Fit mode: every frame is sized like the first image (scaled).
+    No-scale mode: every frame keeps its own pixel size."""
     frames: list[bytes] = []
-    for f in files:
-        pb(f"Loading image: {f.name}")
-        got, _ = load_image_frames(f, width, height, ico_size=ico_sizes.get(f))
-        frames.extend(got)
+    sizes: list[tuple[int, int]] = []
+
+    if st["no_scale"]:
+        for f in files:
+            pb(f"Loading image: {f.name}")
+            w, h = visual_native_size(f, "image", ico_sizes.get(f))
+            got, _ = load_image_frames(f, w, h, ico_size=ico_sizes.get(f))
+            frames.extend(got)
+            sizes.extend([(w, h)] * len(got))
+        width, height = max(s[0] for s in sizes), max(s[1] for s in sizes)
+    else:
+        first = files[0]
+        width, height = scaled_size(
+            visual_native_size(first, "image", ico_sizes.get(first)), st["scale"])
+        for f in files:
+            pb(f"Loading image: {f.name}")
+            got, _ = load_image_frames(f, width, height, ico_size=ico_sizes.get(f),
+                                       smooth=st["smooth"])
+            frames.extend(got)
+        sizes = None
+
     if st["quantize"]:
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
         frames = [quantize_frame(f, st["quantize"]) for f in frames]
     play_mode = "loop" if len(frames) > 1 else "still"
-    drawing2 = build_drawing2(frames, fps, width, height, play_mode)
-    return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px"
+    drawing2 = build_drawing2(frames, fps, width, height, play_mode,
+                              sizes=sizes, scale=st["fixed_scale"])
+    size_note = "sizes kept" if st["no_scale"] else f"{width}×{height}px"
+    return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {size_note}"
 
 
 def do_add_image(bp_path: Path, actor: dict, card: Path):
@@ -2252,7 +2516,19 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
         elif multi:
             pb(f"Each of the {len(files)} {CATEGORY_LABELS[cat]} files will become its own actor.")
 
-        st = prompt_visual_settings(cat, files, multi)
+        # still-image archives: keep one size, or keep every image's pixels as-is
+        no_scale = False
+        if cat == "image" and multi:
+            size_choice = choose("How should image sizes be handled?", [
+                "Scale images to fit (keeps all images the same size)",
+                "Don't scale images (1 pixel = 1 pixel, best for pixel art)",
+            ])
+            no_scale = size_choice.startswith("Don't")
+
+        st = prompt_visual_settings(cat, files, multi, no_scale=no_scale,
+                                    resizes=(frames_mode and not no_scale))
+        if no_scale:
+            st["fixed_scale"] = fixed_density_scale(files, ico_sizes)
 
         fps = 4.0
         if frames_mode:
@@ -2429,6 +2705,69 @@ def load_font(path: Path):
     return TTFont(path)
 
 
+def font_sfnt_bytes(fp: Path, font) -> bytes:
+    """Plain TrueType/OpenType bytes for a font file (unwraps .eot, unpacks .woff)."""
+    ext = fp.suffix.lower()
+    if ext in (".ttf", ".otf"):
+        return fp.read_bytes()
+    if ext == ".eot":
+        return eot_to_sfnt(fp.read_bytes())
+    buf = io.BytesIO()
+    font.flavor = None
+    font.save(buf)
+    return buf.getvalue()
+
+
+def render_font_bitmap(fp: Path, font, codepoints: list[int], px: int,
+                       smooth: bool, color: list):
+    """Render each requested glyph as a filled RGBA image with FreeType.
+    Every frame shares one canvas and one pen origin (like the vector fonts),
+    so swapping frames never makes the glyph jump. `smooth` = anti-aliased
+    edges; off = hard pixels. Returns (png_frames, (w, h), missing_count)."""
+    from PIL import ImageDraw, ImageFont
+    cmap, glyph_set = font.getBestCmap(), font.getGlyphSet()
+    present = []
+    missing = 0
+    for cp in codepoints:
+        name = cmap.get(cp)
+        if not name or name not in glyph_set:
+            missing += 1
+        else:
+            present.append(cp)
+    if not present:
+        return [], (0, 0), missing
+
+    try:
+        ft = ImageFont.truetype(io.BytesIO(font_sfnt_bytes(fp, font)), size=px)
+    except Exception as e:
+        raise RuntimeError(f"Pillow couldn't load this font for bitmap rendering ({e}). "
+                           "It may be missing FreeType support.")
+
+    boxes = [ft.getbbox(chr(cp), anchor="ls") for cp in present]
+    pad = 1
+    min_x, min_y = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    max_x, max_y = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    width, height = max(1, max_x - min_x + 2 * pad), max(1, max_y - min_y + 2 * pad)
+    origin = (pad - min_x, pad - min_y)
+
+    rgb = tuple(round(c * 255) for c in color[:3])
+    alpha = color[3] if len(color) > 3 else 1.0
+    frames = []
+    for cp in present:
+        mask = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.fontmode = "L" if smooth else "1"
+        draw.text(origin, chr(cp), font=ft, fill=255, anchor="ls")
+        if alpha < 1:
+            mask = mask.point(lambda v: int(v * alpha))
+        layer = Image.new("RGBA", (width, height), rgb + (0,))
+        layer.putalpha(mask)
+        buf = io.BytesIO()
+        layer.save(buf, format="PNG")
+        frames.append(buf.getvalue())
+    return frames, (width, height), missing
+
+
 def do_add_font(bp_path: Path, actor: dict, card: Path):
     while True:
         raw = ask_path("Enter the font file path (.ttf, .otf, .woff or .eot, or a .zip/.tar archive of them)")
@@ -2511,55 +2850,80 @@ def do_add_font(bp_path: Path, actor: dict, card: Path):
             pe("No characters/codepoints were selected.")
             return
 
+        style = choose("How should the glyphs be drawn?", [
+            "Vector (outline line segments)",
+            "Bitmap (filled in, one image per glyph)",
+        ])
+        bitmap = style.startswith("Bitmap")
+
         p()
-        raw = ask("Scale multiplier (1.0 = ten Castle units per em)", default="1.0")
-        try:
-            scale = float(raw)
-            if scale <= 0:
-                raise ValueError
-        except ValueError:
-            pw("Invalid scale, using 1.0.")
-            scale = 1.0
-
-        steps = 16
-        if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
+        scale, steps, px, smooth = 1.0, 16, 64, False
+        if bitmap:
             while True:
-                raw = ask("Steps per curve segment", default="16")
-                if raw.isdigit() and int(raw) >= 2:
-                    steps = int(raw)
+                raw = ask("Glyph size in pixels per em (bigger = sharper, larger file)", default="64")
+                if raw.isdigit() and 4 <= int(raw) <= 512:
+                    px = int(raw)
                     break
-                pe("Enter a number ≥ 2")
+                pe("Enter a whole number between 4 and 512.")
+            smooth = yn(SMOOTH_PROMPT, default="n")
+        else:
+            raw = ask("Scale multiplier (1.0 = ten Castle units per em)", default="1.0")
+            try:
+                scale = float(raw)
+                if scale <= 0:
+                    raise ValueError
+            except ValueError:
+                pw("Invalid scale, using 1.0.")
+                scale = 1.0
 
-        color = [0, 0, 0, 1]
-        if yn("Use a custom color instead of black?", default="n"):
-            color = ask_color("Enter glyph color")
+            if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
+                while True:
+                    raw = ask("Steps per curve segment", default="16")
+                    if raw.isdigit() and int(raw) >= 2:
+                        steps = int(raw)
+                        break
+                    pe("Enter a number ≥ 2")
+
+        color = ask_color("Pick the glyph color")
 
         base = copy.deepcopy(actor)
         used_selected = False
         added = 0
         for fp, font in fonts:
-            cmap = font.getBestCmap()
-            glyph_set = font.getGlyphSet()
-            ppu = font["head"].unitsPerEm / 10.0  # 1 em = 10 Castle units before the user's scale multiplier
-
             p()
             pb(f"Rendering {len(codepoints)} glyph(s) from '{label}' ({fp.name})...")
-            glyph_frames = []
-            missing = 0
-            for cp in codepoints:
-                glyph_name = cmap.get(cp)
-                if not glyph_name or glyph_name not in glyph_set:
-                    missing += 1
+            if bitmap:
+                try:
+                    frames, (gw, gh), missing = render_font_bitmap(
+                        fp, font, codepoints, px, smooth, color)
+                except (Exception, SystemExit) as e:
+                    pe(f"{fp.name}: {e}")
                     continue
-                d = font_glyph_svg_d(glyph_set, glyph_name)
-                path_data, bounds = font_glyph_to_path_data(d, steps, ppu, scale, color)
-                glyph_frames.append((cp, path_data, bounds))
+                count = len(frames)
+                if count:
+                    drawing2 = build_drawing2(frames, 4, gw, gh, "still")
+            else:
+                cmap = font.getBestCmap()
+                glyph_set = font.getGlyphSet()
+                ppu = font["head"].unitsPerEm / 10.0  # 1 em = 10 Castle units before the user's scale multiplier
+                glyph_frames = []
+                missing = 0
+                for cp in codepoints:
+                    glyph_name = cmap.get(cp)
+                    if not glyph_name or glyph_name not in glyph_set:
+                        missing += 1
+                        continue
+                    d = font_glyph_svg_d(glyph_set, glyph_name)
+                    path_data, bounds = font_glyph_to_path_data(d, steps, ppu, scale, color)
+                    glyph_frames.append((cp, path_data, bounds))
+                count = len(glyph_frames)
+                if count:
+                    drawing2 = build_drawing2_font(glyph_frames, ppu, scale=10)
 
-            if not glyph_frames:
+            if not count:
                 pe(f"None of the requested codepoints have a glyph in {fp.name}.")
                 continue
 
-            drawing2 = build_drawing2_font(glyph_frames, ppu, scale=10)
             t_path, t_actor, is_selected = next_target(
                 card, bp_path, actor, base, used_selected, fp.stem)
             used_selected = True
@@ -2568,7 +2932,7 @@ def do_add_font(bp_path: Path, actor: dict, card: Path):
 
             if missing:
                 pw(f"{missing} requested codepoint(s) have no glyph in this font and were skipped.")
-            ps(f"Font added: {len(glyph_frames)} frame(s), one per glyph (frame order matches codepoint order).")
+            ps(f"Font added: {count} frame(s), one per glyph (frame order matches codepoint order).")
             if is_selected:
                 maybe_delete_placeholder_script(card, bp_path)
             else:

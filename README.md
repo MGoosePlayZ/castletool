@@ -26,10 +26,10 @@ You may also use `castletool --cli` for the legacy interface.
 
 ## Capabilities
 
-- **Add image** — bitmap images, animated GIF/WEBP/APNG, video (with sound), and SVG are all supported.
+- **Add image** — bitmap images, animated GIF/WEBP/APNG, video (with sound), and SVG are all supported. SVGs can be drawn as vector line segments or as a filled bitmap.
 - **Add audio** — uploads a sound to Castle and plays it from the actor on create (looped), the same way a video's sound is added. Castle limits sounds to 30 seconds, so longer audio (and longer video soundtracks) is split into parts just under 30s, uploaded one by one, and chained to play back to back.
 - **Add MIDI** — converts a MIDI file into a Castle `Music` component.
-- **Add Font** — renders a font's characters as vectors.
+- **Add Font** — renders a font's characters as vector outlines or as filled bitmap glyphs.
 - **Edit Background Color** — sets the card's background color.
 - **Upload Deck** — runs `castle save-deck` on the current deck.
 
@@ -53,9 +53,18 @@ You may also use `castletool --cli` for the legacy interface.
 Anywhere castletool asks for a file you can give a `.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2` or `.tar.xz`/`.txz` instead. Subdirectories are searched and unsupported files inside are ignored.
 
 - All supported files in an archive must have the **same purpose** (all images, all videos, all audio, ...). Otherwise you get `Supported files are of different purpose`.
-- **Still images**: you choose between putting them all in the current actor as frames (in natural filename order), or making each its own actor.
+- **Still images**: you choose between putting them all in the current actor as frames (in natural filename order), or making each its own actor. You also choose how sizes are handled:
+  - *Scale images to fit* keeps all images the same size.
+  - *Don't scale images* keeps 1 pixel = 1 pixel no matter what (every image shares one pixel density, so bigger images appear bigger). Best for pixel art or small images where accuracy matters.
 - **Animated images, videos, SVGs, audio and fonts**: each file automatically becomes its own actor. The first goes into the actor you selected; the rest are forked from it as new blueprints in the same card.
 - The same settings (scale, quantize, characters, ...) are used for every file in the archive.
+
+## Bitmap SVGs and fonts
+
+- **SVG** — choose *Vector* (line segments, the default) or *Bitmap* (filled in, keeps its colors; even-odd fill, so holes work). Not supported: gradients, transforms, `<style>` blocks/classes.
+- **Font** — choose *Vector* (outlines) or *Bitmap* (one filled image per glyph, drawn with FreeType at a pixel size you choose). Glyphs share one canvas and baseline so frames don't jump.
+- **Colors** — an SVG's own colors (attributes, inline `style`, inherited from groups) are used by default. If a shape doesn't specify one, you pick a color for those shapes. Fonts always ask you to pick a color.
+- **Bilinear interpolation** — off by default (crisp nearest-neighbor pixels). Turn it on for smooth scaling of images and video, and for anti-aliased edges on bitmap SVGs and fonts.
 
 ## Add Font: Basic
 
