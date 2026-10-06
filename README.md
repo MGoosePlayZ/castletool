@@ -27,7 +27,7 @@ You may also use `castletool --cli` for the legacy interface.
 ## Capabilities
 
 - **Add image** — bitmap images, animated GIF/WEBP/APNG, video (with sound), and SVG are all supported.
-- **Add audio** — uploads a sound to Castle and plays it from the actor on create (looped), the same way a video's sound is added.
+- **Add audio** — uploads a sound to Castle and plays it from the actor on create (looped), the same way a video's sound is added. Castle limits sounds to 30 seconds, so longer audio (and longer video soundtracks) is split into parts just under 30s, uploaded one by one, and chained to play back to back.
 - **Add MIDI** — converts a MIDI file into a Castle `Music` component.
 - **Add Font** — renders a font's characters as vectors.
 - **Edit Background Color** — sets the card's background color.

@@ -661,6 +661,52 @@ def extract_audio_mp3(path: Path, out_path: Path):
     )
 
 
+def probe_duration(path: Path) -> float | None:
+    """Duration in seconds via ffprobe, or None if unknown."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True
+    )
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return None
+
+
+def split_audio_mp3(path: Path, out_dir: Path, is_video: bool) -> list[Path]:
+    """Convert `path`'s sound to MP3 part(s) of at most AUDIO_CHUNK_SECONDS
+    each, in playback order. An MP3 that's already short enough is returned
+    untouched. Needs ffmpeg for anything else."""
+    already_mp3 = (not is_video) and path.suffix.lower() == ".mp3"
+    duration = probe_duration(path) if HAS_FFMPEG else None
+    if already_mp3 and (not HAS_FFMPEG or (duration is not None and duration <= AUDIO_CHUNK_SECONDS)):
+        return [path]
+    if not HAS_FFMPEG:
+        raise RuntimeError("ffmpeg is required to convert audio. Install with: pkg install ffmpeg")
+
+    stem = "audio" if is_video else path.stem
+    pattern = out_dir / f"{stem}_part%03d.mp3"
+    codec = (["-c:a", "copy"] if already_mp3 else
+             ["-c:a", "libmp3lame", "-b:a", "96k", "-ar", "44100", "-ac", "2"])
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(path), "-vn", *codec,
+         "-f", "segment", "-segment_time", str(AUDIO_SEGMENT_SECONDS),
+         "-reset_timestamps", "1", str(pattern)],
+        check=True
+    )
+    parts = sorted(out_dir.glob(f"{stem}_part*.mp3"))
+    if not parts:
+        raise RuntimeError("ffmpeg produced no audio. Does the file have a sound track?")
+    if len(parts) == 1:
+        # Short enough for one piece: keep the plain, unsuffixed name.
+        single = out_dir / f"{stem}.mp3"
+        parts[0].rename(single)
+        return [single]
+    return parts
+
+
 def get_castle_token() -> str:
     """Read the Castle CLI's saved login token from ~/.castle/config.json."""
     config_path = Path.home() / ".castle" / "config.json"
@@ -759,30 +805,48 @@ def upload_audio_file(path: Path) -> dict:
     return uploaded
 
 
-def create_audio_rule(upload_url: str) -> dict:
-    """A Rules-component rule that plays an uploaded sound on create and
-    loops it forever (mirrors Castle's own "play on create + loop" pattern)."""
+AUDIO_CHUNK_SECONDS = 30      # Castle rejects sounds longer than this
+# Cut a hair under the limit: MP3 frames are ~26ms, and a cut lands on the next
+# frame boundary, so a part cut at exactly 30s can come out at 30.01s.
+AUDIO_SEGMENT_SECONDS = 29.9
+
+
+def _play_sound_response(upload_url: str) -> dict:
+    return {
+        "name": "play sound",
+        "behaviorId": 16,
+        "params": {
+            "type": "library",
+            "playbackRate": 1, "amplitude": 1, "pan": 0,
+            "recordingUrl": "", "uploadUrl": upload_url,
+            "category": "random", "seed": 1337,
+            "mutationSeed": 0, "mutationAmount": 5,
+            "midiNote": 60, "waveform": "square",
+            "attack": 0, "release": 0.4, "wait": True,
+        },
+    }
+
+
+def create_audio_rule(upload_urls) -> dict:
+    """A Rules-component rule that plays uploaded sound(s) on create and loops
+    forever (mirrors Castle's own "play on create + loop" pattern). Given
+    several URLs (a sound split into <=30s parts) the "play sound" responses
+    are chained with "next", each with "wait until sound ends" set, so the
+    parts play back to back without overlapping."""
+    if isinstance(upload_urls, str):
+        upload_urls = [upload_urls]
+    chain = None
+    for url in reversed(upload_urls):
+        resp = _play_sound_response(url)
+        if chain is not None:
+            resp["next"] = chain
+        chain = resp
     return {
         "trigger": {"name": "create", "behaviorId": 16, "params": {}},
         "response": {
             "name": "infinite repeat",
             "behaviorId": 16,
-            "params": {
-                "interval": 0.01666,
-                "body": {
-                    "name": "play sound",
-                    "behaviorId": 16,
-                    "params": {
-                        "type": "library",
-                        "playbackRate": 1, "amplitude": 1, "pan": 0,
-                        "recordingUrl": "", "uploadUrl": upload_url,
-                        "category": "random", "seed": 1337,
-                        "mutationSeed": 0, "mutationAmount": 5,
-                        "midiNote": 60, "waveform": "square",
-                        "attack": 0, "release": 0.4, "wait": True,
-                    },
-                },
-            },
+            "params": {"interval": 0.01666, "body": chain},
         },
     }
 
@@ -795,13 +859,13 @@ def is_audio_loop_rule(rule: dict) -> bool:
     )
 
 
-def add_or_replace_audio_rule(actor: dict, upload_url: str):
+def add_or_replace_audio_rule(actor: dict, upload_urls):
     components = actor["actorBlueprint"]["components"]
     rules_component = components.setdefault("Rules", {"rules": [], "disabled": False})
     rules_component.setdefault("rules", [])
     rules_component["disabled"] = False
 
-    replacement = create_audio_rule(upload_url)
+    replacement = create_audio_rule(upload_urls)
     for i, rule in enumerate(rules_component["rules"]):
         if is_audio_loop_rule(rule):
             rules_component["rules"][i] = replacement
@@ -1999,23 +2063,24 @@ def next_target(card: Path, bp_path: Path, actor: dict, base: dict,
 
 def attach_audio(actor: dict, src: Path, is_video: bool) -> bool:
     """Upload `src`'s sound to Castle and add a play-on-create loop rule to
-    `actor`. Videos have their track extracted; audio files are sent as-is if
-    they're already MP3, otherwise converted. Returns True on success."""
+    `actor`. Castle limits sounds to 30 seconds, so longer audio is split into
+    parts under 30s that are uploaded one by one and chained to play in order.
+    Videos have their track extracted; MP3s that fit are sent as-is.
+    Returns True on success (the actor is left untouched on failure)."""
     tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-audio-"))
     try:
-        if not is_video and src.suffix.lower() == ".mp3":
-            mp3_path = src
+        pb("Extracting audio..." if is_video else f"Converting {src.name}...")
+        parts = split_audio_mp3(src, tmp_dir, is_video)
+        urls = []
+        for i, part in enumerate(parts, 1):
+            label = f" (part {i}/{len(parts)})" if len(parts) > 1 else ""
+            pb(f"Uploading audio to Castle{label}...")
+            urls.append(upload_audio_file(part)["url"])
+        add_or_replace_audio_rule(actor, urls)
+        if len(urls) > 1:
+            ps(f"Audio added: {len(urls)} parts (each under {AUDIO_CHUNK_SECONDS}s), played back to back")
         else:
-            if not HAS_FFMPEG:
-                pe("ffmpeg is required to convert audio. Install with: pkg install ffmpeg")
-                return False
-            mp3_path = tmp_dir / ("audio.mp3" if is_video else f"{src.stem}.mp3")
-            pb("Extracting audio..." if is_video else f"Converting {src.name} to MP3...")
-            extract_audio_mp3(src, mp3_path)
-        pb("Uploading audio to Castle...")
-        uploaded = upload_audio_file(mp3_path)
-        add_or_replace_audio_rule(actor, uploaded["url"])
-        ps(f"Audio added: {uploaded['url']}")
+            ps(f"Audio added: {urls[0]}")
         return True
     except Exception as e:
         pe(f"Audio upload failed: {e}")
