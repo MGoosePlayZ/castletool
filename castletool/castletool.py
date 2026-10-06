@@ -27,7 +27,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.5.7"
+CURRENT_VERSION = "0.5.8"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -831,15 +831,16 @@ def create_audio_rule(upload_urls) -> dict:
     """A Rules-component rule that plays uploaded sound(s) on create and loops
     forever (mirrors Castle's own "play on create + loop" pattern). Given
     several URLs (a sound split into <=30s parts) the "play sound" responses
-    are chained with "next", each with "wait until sound ends" set, so the
-    parts play back to back without overlapping."""
+    are chained via "nextResponse" (nested inside each response's params, which
+    is how Castle stores it; a sibling "next" key is ignored), each with "wait
+    until sound ends" set, so the parts play back to back without overlapping."""
     if isinstance(upload_urls, str):
         upload_urls = [upload_urls]
     chain = None
     for url in reversed(upload_urls):
         resp = _play_sound_response(url)
         if chain is not None:
-            resp["next"] = chain
+            resp["params"]["nextResponse"] = chain
         chain = resp
     return {
         "trigger": {"name": "create", "behaviorId": 16, "params": {}},
