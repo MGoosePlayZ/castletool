@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "castletool"
-version = "0.5.6"
+version = "0.5.7"
 description = "Interactive Castle deck editor: inject images, animated GIF/WEBP/APNG, video with sound, audio, SVG, MIDI music and vector-rendered fonts (from files or zip/tar archives) into Castle blueprints, set card backgrounds, and upload decks, via a tap/click TUI or a classic CLI."
 readme = "README.md"
 authors = [
