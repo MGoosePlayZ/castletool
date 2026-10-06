@@ -8,7 +8,7 @@ logic (image/MIDI conversion, Castle GraphQL calls, etc). Instead it swaps
 out the plain-terminal I/O primitives that module.castletool uses
 (`p`, `pb`, `pw`, `pe`, `ps`, `ask`, `yn`, `choose`, `multi_choose`,
 `ask_charspec`, `ask_path`) for equivalents backed by Textual widgets,
-then drives the exact same `do_add_image` / `do_add_midi` / `do_add_font` /
+then drives the exact same `do_add_image` / `do_add_audio` / `do_add_midi` / `do_add_font` /
 `do_edit_background_color` / `do_upload_deck` functions that the classic
 CLI uses.
 
@@ -581,6 +581,7 @@ class CastletoolApp(App):
             options = []
             if ct.HAS_PIL:
                 options.append("Add image")
+            options.append("Add audio")
             if ct.HAS_MIDO:
                 options.append("Add MIDI")
             if ct.HAS_FONTTOOLS:
@@ -594,6 +595,8 @@ class CastletoolApp(App):
 
             if action == "Add image":
                 ct.do_add_image(bp_path, actor, card)
+            elif action == "Add audio":
+                ct.do_add_audio(bp_path, actor, card)
             elif action == "Add MIDI":
                 ct.do_add_midi(bp_path, actor, card)
             elif action == "Add Font":

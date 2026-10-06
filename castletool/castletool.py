@@ -14,17 +14,20 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.5.1"
+CURRENT_VERSION = "0.5.5"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -48,6 +51,15 @@ except ImportError:
     HAS_FONTTOOLS = False
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
+
+# pillow-heif is optional (HEIC/HEIF); installed on first use by ensure_heif().
+HAS_HEIF = False
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HAS_HEIF = True
+except Exception:
+    pass
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -524,8 +536,11 @@ def set_card_tempo(card: Path, bpm: float):
 
 # ── image/gif → Drawing2 ─────────────────────────────────────────────────────
 
-def load_image_frames(path: Path, width: int, height: int):
+def load_image_frames(path: Path, width: int, height: int, ico_size=None):
     img = Image.open(path)
+    if ico_size:
+        # .ico files embed several resolutions; select one before decoding.
+        img.size = tuple(ico_size)
 
     # Normal image
     if not getattr(img, "is_animated", False):
@@ -1677,147 +1692,619 @@ def maybe_delete_placeholder_script(card: Path, bp_path: Path):
         script_path.write_text("", encoding="utf-8")
         ps(f"Cleared placeholder script: {script_path.name}")
 
-def do_add_image(bp_path: Path, actor: dict, card: Path):
-    while True:
-        raw = ask_path("Enter the file path for your image")
-        img_path = resolve_path(raw)
-        if img_path.exists():
-            break
-        pe(f"File not found: {img_path}")
+# ── supported file types / archives ──────────────────────────────────────────
+# Every file castletool accepts is sorted into one "purpose" category. A
+# compressed archive may only contain files of ONE category.
 
-    ext = img_path.suffix.lower()
-    is_anim = ext in (".gif", ".webp", ".mp4", ".mov", ".webm", ".avi")
-    is_video = ext in (".mp4", ".mov", ".webm", ".avi")
-    is_vector = ext in (".svg",)
-    if ext in (".png", ".apng"):
-        # Plain PNGs are never animated, but an APNG (still a .png/.apng file
-        # on disk, just with an acTL chunk) is. Pillow already exposes that
-        # via is_animated, so just ask it instead of assuming from extension.
-        with Image.open(img_path) as _probe:
-            is_anim = getattr(_probe, "is_animated", False)
-    file_size = img_path.stat().st_size
+ISSUES_URL = "https://github.com/MGoosePlayZ/castletool/issues"
 
-    # native size + scale
-    p()
-    width, height, every, quantize = None, None, 1, 0
-    if not is_vector:
-        if is_video:
-            if not HAS_FFMPEG:
-                pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
-                return
-            native_w, native_h = probe_video_dimensions(img_path)
+IMAGE_EXTS  = {".png", ".apng", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff",
+               ".ico", ".heic", ".heif", ".gif", ".webp"}
+VIDEO_EXTS  = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".flv", ".m4v",
+               ".3gp", ".ogv"}
+VECTOR_EXTS = {".svg"}
+AUDIO_EXTS  = {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".flac", ".aac"}
+FONT_EXTS   = {".ttf", ".otf", ".woff", ".eot"}
+ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2",
+                    ".tar.xz", ".txz")
+MAX_ARCHIVE_BYTES = 2 * 1024 ** 3   # refuse to unpack more than 2 GiB
+
+CATEGORY_LABELS = {
+    "image": "image", "animation": "animated image", "video": "video",
+    "vector": "vector graphic", "audio": "audio", "font": "font",
+}
+ACTION_FOR_CATEGORY = {
+    "image": "Add image", "animation": "Add image", "video": "Add image",
+    "vector": "Add image", "audio": "Add audio", "font": "Add Font",
+}
+
+
+def is_archive(path: Path) -> bool:
+    return path.name.lower().endswith(ARCHIVE_SUFFIXES)
+
+
+def classify_file(path: Path) -> str | None:
+    """Return the file's purpose category, or None if it isn't supported."""
+    ext = path.suffix.lower()
+    if ext in VIDEO_EXTS:  return "video"
+    if ext in VECTOR_EXTS: return "vector"
+    if ext in AUDIO_EXTS:  return "audio"
+    if ext in FONT_EXTS:   return "font"
+    if ext in IMAGE_EXTS:
+        # GIF/WEBP/PNG may or may not be animated; ask Pillow.
+        if ext in (".png", ".apng", ".gif", ".webp") and HAS_PIL:
+            try:
+                with Image.open(path) as im:
+                    if getattr(im, "is_animated", False):
+                        return "animation"
+            except Exception:
+                pass
+        return "image"
+    return None
+
+
+def report_unsupported(path: Path):
+    ext = path.suffix.lower() or "(no extension)"
+    pe(f"Unsupported file type: {ext}")
+    p(f"If you'd like {ext} supported, please make an issue on GitHub: {ISSUES_URL}")
+
+
+def check_category(cat: str, expected_action: str) -> bool:
+    """True if `cat` belongs to `expected_action`; otherwise explain where it goes."""
+    right = ACTION_FOR_CATEGORY[cat]
+    if right == expected_action:
+        return True
+    label = CATEGORY_LABELS[cat]
+    article = "an" if label[0] in "aeiou" else "a"
+    pe(f"That's {article} {label} file. Use \"{right}\" for it, not \"{expected_action}\".")
+    return False
+
+
+def _natural_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def _safe_dest(root: Path, member_name: str) -> Path | None:
+    """Map an archive member name to a path inside `root`, or None to skip it
+    (path traversal, macOS resource-fork junk, etc)."""
+    parts = [x for x in member_name.replace("\\", "/").split("/") if x not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    if any(x == "__MACOSX" or x == ".DS_Store" or x.startswith("._") for x in parts):
+        return None
+    target = root.joinpath(*parts)
+    try:
+        target.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def extract_archive(path: Path, dest: Path) -> list[Path]:
+    """Unpack a .zip / .tar(.gz/.bz2/.xz) into `dest` (subdirectories included)
+    and return every extracted file in natural path order."""
+    written: list[Path] = []
+    total = 0
+
+    def _check(size: int):
+        nonlocal total
+        total += size
+        if total > MAX_ARCHIVE_BYTES:
+            raise ValueError("archive is too large to unpack (limit 2 GiB)")
+
+    if path.name.lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                target = _safe_dest(dest, info.filename)
+                if target is None:
+                    continue
+                _check(info.file_size)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                written.append(target)
+    else:
+        with tarfile.open(path) as tf:
+            for member in tf:
+                if not member.isreg():
+                    continue
+                target = _safe_dest(dest, member.name)
+                if target is None:
+                    continue
+                _check(member.size)
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                written.append(target)
+
+    written.sort(key=lambda f: _natural_key(str(f.relative_to(dest))))
+    return written
+
+
+def gather_media(path: Path, tmp_dir: Path):
+    """Turn what the user pointed at (a file or an archive) into
+    (files, category). Prints the reason and returns None if nothing usable."""
+    if not is_archive(path):
+        cat = classify_file(path)
+        if cat is None:
+            report_unsupported(path)
+            return None
+        return [path], cat
+
+    pb(f"Reading archive: {path.name}")
+    try:
+        files = extract_archive(path, tmp_dir)
+    except Exception as e:
+        pe(f"Could not read archive: {e}")
+        return None
+    if not files:
+        pe("The archive doesn't contain any files.")
+        return None
+
+    by_cat: dict[str, list[Path]] = {}
+    ignored = 0
+    for f in files:
+        cat = classify_file(f)
+        if cat is None:
+            ignored += 1
         else:
-            with Image.open(img_path) as _img:
-                native_w, native_h = _img.size
+            by_cat.setdefault(cat, []).append(f)
+    if ignored:
+        pw(f"Ignored {ignored} unsupported file(s) in the archive.")
+    if not by_cat:
+        pe("No supported files were found in the archive.")
+        p(f"If you'd like a format supported, please make an issue on GitHub: {ISSUES_URL}")
+        return None
+    if len(by_cat) > 1:
+        pe("Supported files are of different purpose")
+        found = ", ".join(f"{len(v)} {CATEGORY_LABELS[c]}" for c, v in by_cat.items())
+        pw(f"Found: {found}")
+        return None
+    cat, flist = next(iter(by_cat.items()))
+    ps(f"Found {len(flist)} {CATEGORY_LABELS[cat]} file(s).")
+    return flist, cat
 
-        raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)", default="1")
+
+# ── HEIC/HEIF (optional plugin) ──────────────────────────────────────────────
+
+def ensure_heif() -> bool:
+    """Make sure Pillow can open HEIC/HEIF. Tries to pip-install pillow-heif
+    on first use (it's optional because it can fail to build on some devices)."""
+    global HAS_HEIF
+    if HAS_HEIF:
+        return True
+
+    def _try() -> bool:
         try:
-            img_scale = float(raw)
-            if img_scale <= 0:
-                raise ValueError
-        except ValueError:
-            pw("Invalid scale, using 1.")
-            img_scale = 1.0
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+            return True
+        except Exception:
+            return False
 
-        width = max(1, round(native_w * img_scale))
-        height = max(1, round(native_h * img_scale))
+    HAS_HEIF = _try()
+    if not HAS_HEIF:
+        pb("Installing pillow-heif...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pillow-heif"])
+        HAS_HEIF = _try()
+    if not HAS_HEIF:
+        pe("HEIC/HEIF support needs the 'pillow-heif' package, and it couldn't be installed. "
+           "Try: pip install pillow-heif")
+    return HAS_HEIF
 
-        # frame skip for animations
-        if is_anim:
-            p()
-            if yn("Would you like to skip frames? (reduces file size for long GIFs)", default="n"):
-                while True:
-                    raw = ask("Keep every Nth frame (e.g. 2 = half frames, 4 = quarter)", default="2")
-                    if raw.isdigit() and int(raw) >= 1:
-                        every = int(raw)
-                        break
-                    pe("Enter a positive integer.")
 
-        # quantize
-        p()
-        if file_size > 500_000:
-            pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
-        if yn("Would you like to quantize this image? (reduces file size)", default="y" if file_size > 500_000 else "n"):
-            while True:
-                raw = ask("Select number of colors", default="256")
-                if raw.isdigit() and 1 <= int(raw) <= 256:
-                    quantize = int(raw)
-                    break
-                pe("Enter a number between 1 and 256.")
+def usable_files(files: list[Path]) -> list[Path]:
+    """Drop files whose decoder isn't available (currently just HEIC/HEIF)."""
+    if any(f.suffix.lower() in (".heic", ".heif") for f in files) and not ensure_heif():
+        files = [f for f in files if f.suffix.lower() not in (".heic", ".heif")]
+        if not files:
+            pe("Nothing left to import.")
+    return files
 
+
+# ── ICO resolution picking ───────────────────────────────────────────────────
+
+def ico_sizes_of(path: Path) -> list[tuple[int, int]]:
+    """Resolutions embedded in an .ico, largest first."""
+    with Image.open(path) as im:
+        sizes = im.info.get("sizes")
+        if not sizes and hasattr(im, "ico"):
+            sizes = im.ico.sizes()
+        if not sizes:
+            sizes = {im.size}
+    return sorted(sizes, key=lambda s: (s[0] * s[1], s[0]), reverse=True)
+
+
+def pick_ico_sizes(files: list[Path]) -> dict[Path, tuple[int, int]]:
+    """Let the user choose which embedded resolution to use for each .ico."""
+    icos = [f for f in files if f.suffix.lower() == ".ico"]
+    result: dict[Path, tuple[int, int]] = {}
+    policy = None
+    for f in icos:
+        try:
+            sizes = ico_sizes_of(f)
+        except Exception as e:
+            pe(f"Could not read {f.name}: {e}")
+            continue
+        if len(sizes) == 1:
+            result[f] = sizes[0]
+            continue
+        if len(icos) > 1 and policy is None:
+            policy = choose("Several .ico files have multiple resolutions. How should they be picked?", [
+                "Largest available for every icon",
+                "Smallest available for every icon",
+                "Let me choose for each icon",
+            ])
+        if policy and policy.startswith("Largest"):
+            result[f] = sizes[0]
+        elif policy and policy.startswith("Smallest"):
+            result[f] = sizes[-1]
+        else:
+            labels = [f"{w}×{h}" for w, h in sizes]
+            chosen = choose(f"Select a resolution for {f.name}:", labels)
+            result[f] = sizes[labels.index(chosen)]
+    return result
+
+
+# ── forking extra actors ─────────────────────────────────────────────────────
+
+def strip_audio_rules(actor: dict):
+    rules = actor.get("actorBlueprint", {}).get("components", {}).get("Rules")
+    if rules and isinstance(rules.get("rules"), list):
+        rules["rules"] = [r for r in rules["rules"] if not is_audio_loop_rule(r)]
+
+
+def fork_actor(card: Path, base_actor: dict, name: str) -> tuple[Path, dict]:
+    """Copy `base_actor` into a brand-new blueprint file in the card's
+    blueprints folder (new id, titled after `name`). Returns (path, actor)."""
+    bp_dir = card / "scene" / "blueprints"
+    bp_dir.mkdir(parents=True, exist_ok=True)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "actor"
+    path = bp_dir / f"{stem}.json"
+    n = 2
+    while path.exists():
+        path = bp_dir / f"{stem}_{n}.json"
+        n += 1
+    new = copy.deepcopy(base_actor)
+    if "entryId" in new:
+        new["entryId"] = str(uuid.uuid4())
+    new["title"] = name
+    if isinstance(new.get("library"), dict):
+        new["library"]["blueprintAssetId"] = str(uuid.uuid4())
+    return path, new
+
+
+def write_actor(path: Path, actor: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(actor, f, indent=2)
+
+
+def next_target(card: Path, bp_path: Path, actor: dict, base: dict,
+                used_selected: bool, name: str):
+    """The first successful file goes into the selected actor; each one after
+    that goes into a fresh fork of the actor as it was before this action.
+    Returns (path, actor, is_selected)."""
+    if not used_selected:
+        return bp_path, actor, True
+    path, new = fork_actor(card, base, name)
+    return path, new, False
+
+
+# ── shared audio upload (used by video-with-sound and plain audio files) ─────
+
+def attach_audio(actor: dict, src: Path, is_video: bool) -> bool:
+    """Upload `src`'s sound to Castle and add a play-on-create loop rule to
+    `actor`. Videos have their track extracted; audio files are sent as-is if
+    they're already MP3, otherwise converted. Returns True on success."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-audio-"))
+    try:
+        if not is_video and src.suffix.lower() == ".mp3":
+            mp3_path = src
+        else:
+            if not HAS_FFMPEG:
+                pe("ffmpeg is required to convert audio. Install with: pkg install ffmpeg")
+                return False
+            mp3_path = tmp_dir / ("audio.mp3" if is_video else f"{src.stem}.mp3")
+            pb("Extracting audio..." if is_video else f"Converting {src.name} to MP3...")
+            extract_audio_mp3(src, mp3_path)
+        pb("Uploading audio to Castle...")
+        uploaded = upload_audio_file(mp3_path)
+        add_or_replace_audio_rule(actor, uploaded["url"])
+        ps(f"Audio added: {uploaded['url']}")
+        return True
+    except Exception as e:
+        pe(f"Audio upload failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── image / animation / video / vector → Drawing2 ────────────────────────────
+
+def prompt_visual_settings(cat: str, files: list[Path], multi: bool) -> dict:
+    """Ask the processing questions once; they apply to every file."""
+    st = {"scale": 1.0, "every": 1, "quantize": 0,
+          "svg_scale": 1.0, "steps": 16, "color": None}
+    note = " (applies to every file)" if multi else ""
     p()
-    if is_vector:
-        pb(f"Loading SVG: {img_path.name}")
-        svg_scale = 1.0
-        if yn("Would you like to scale the SVG output?", default="n"):
+
+    if cat == "vector":
+        if yn("Would you like to scale the SVG output?" + note, default="n"):
             while True:
                 raw = ask("Enter scale multiplier (e.g. 2.0 = twice as large)", default="1.0")
                 try:
-                    svg_scale = float(raw)
+                    st["svg_scale"] = float(raw)
                     break
                 except ValueError:
                     pe("Enter a number like 1.0 or 0.5")
-        steps = 16
         if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
             while True:
                 raw = ask("Steps per curve segment", default="16")
                 if raw.isdigit() and int(raw) >= 2:
-                    steps = int(raw)
+                    st["steps"] = int(raw)
                     break
                 pe("Enter a number ≥ 2")
-        svg_color = None
         if yn("Override the SVG's own colors with a single custom color?", default="n"):
-            svg_color = ask_color("Enter override color")
-        path_data, bounds, fill_bounds = svg_to_path_data(
-            img_path, steps=steps, scale=svg_scale, color=svg_color)
-        drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
-        ps(f"SVG ready: {len(path_data)} line segments")
-    else:
-        pb(f"Loading {'video' if is_video else 'image'}: {img_path.name}")
-        if is_video:
-            if not HAS_FFMPEG:
-                pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
-                return
-            frames, fps = extract_mp4_frames(img_path, width, height, every_n=every)
-        else:
-            frames, fps = load_image_frames(img_path, width, height)
-            if every > 1:
-                frames = frames[::every]
-                fps = fps / every
+            st["color"] = ask_color("Enter override color")
+        return st
 
-        if quantize:
-            pb(f"Quantizing {len(frames)} frame(s) to {quantize} colors...")
-            frames = [quantize_frame(f, quantize) for f in frames]
+    raw = ask("Scale (1 = full resolution, 0.5 = half, 2 = double)" + note, default="1")
+    try:
+        st["scale"] = float(raw)
+        if st["scale"] <= 0:
+            raise ValueError
+    except ValueError:
+        pw("Invalid scale, using 1.")
+        st["scale"] = 1.0
 
-        play_mode = "loop" if is_anim else "still"
-        drawing2 = build_drawing2(frames, fps, width, height, play_mode)
-        ps(f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px")
-
-    actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
-
-    if is_video and probe_has_audio(img_path):
+    if cat in ("animation", "video"):
         p()
-        if yn("This video has audio. Upload it and play it with the actor?", default="y"):
-            tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-audio-"))
-            audio_path = tmp_dir / "audio.mp3"
+        if yn("Would you like to skip frames? (reduces file size for long GIFs)", default="n"):
+            while True:
+                raw = ask("Keep every Nth frame (e.g. 2 = half frames, 4 = quarter)", default="2")
+                if raw.isdigit() and int(raw) >= 1:
+                    st["every"] = int(raw)
+                    break
+                pe("Enter a positive integer.")
+
+    p()
+    file_size = max(f.stat().st_size for f in files)
+    if file_size > 500_000:
+        pw(f"This file is abnormally large ({file_size//1024}KB). Quantizing is recommended.")
+    if yn("Would you like to quantize this image? (reduces file size)" if not multi
+          else "Would you like to quantize these images? (reduces file size)",
+          default="y" if file_size > 500_000 else "n"):
+        while True:
+            raw = ask("Select number of colors", default="256")
+            if raw.isdigit() and 1 <= int(raw) <= 256:
+                st["quantize"] = int(raw)
+                break
+            pe("Enter a number between 1 and 256.")
+    return st
+
+
+def visual_native_size(path: Path, cat: str, ico_size=None) -> tuple[int, int]:
+    if cat == "video":
+        return probe_video_dimensions(path)
+    if ico_size:
+        return ico_size
+    with Image.open(path) as im:
+        return im.size
+
+
+def scaled_size(native: tuple[int, int], scale: float) -> tuple[int, int]:
+    return max(1, round(native[0] * scale)), max(1, round(native[1] * scale))
+
+
+def render_visual(path: Path, cat: str, st: dict, ico_size=None):
+    """Convert one file into a Drawing2 component. Returns (drawing2, summary)."""
+    if cat == "vector":
+        pb(f"Loading SVG: {path.name}")
+        path_data, bounds, fill_bounds = svg_to_path_data(
+            path, steps=st["steps"], scale=st["svg_scale"], color=st["color"])
+        drawing2 = build_drawing2_vector(path_data, bounds, fill_bounds)
+        return drawing2, f"SVG ready: {len(path_data)} line segments"
+
+    width, height = scaled_size(visual_native_size(path, cat, ico_size), st["scale"])
+    pb(f"Loading {'video' if cat == 'video' else 'image'}: {path.name}")
+    if cat == "video":
+        frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"])
+    else:
+        frames, fps = load_image_frames(path, width, height, ico_size=ico_size)
+        if st["every"] > 1:
+            frames = frames[::st["every"]]
+            fps = fps / st["every"]
+    if st["quantize"]:
+        pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
+        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+    play_mode = "loop" if (cat in ("animation", "video") or len(frames) > 1) else "still"
+    drawing2 = build_drawing2(frames, fps, width, height, play_mode)
+    return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px"
+
+
+def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float):
+    """Several still images → ONE Drawing2 with one frame per image. Every
+    frame is sized like the first image (scaled)."""
+    first = files[0]
+    width, height = scaled_size(
+        visual_native_size(first, "image", ico_sizes.get(first)), st["scale"])
+    frames: list[bytes] = []
+    for f in files:
+        pb(f"Loading image: {f.name}")
+        got, _ = load_image_frames(f, width, height, ico_size=ico_sizes.get(f))
+        frames.extend(got)
+    if st["quantize"]:
+        pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
+        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+    play_mode = "loop" if len(frames) > 1 else "still"
+    drawing2 = build_drawing2(frames, fps, width, height, play_mode)
+    return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {width}×{height}px"
+
+
+def do_add_image(bp_path: Path, actor: dict, card: Path):
+    while True:
+        raw = ask_path("Enter the file path for your image/video (or a .zip/.tar archive of them)")
+        src = resolve_path(raw)
+        if src.exists():
+            break
+        pe(f"File not found: {src}")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-media-"))
+    try:
+        found = gather_media(src, tmp_dir)
+        if not found:
+            return
+        files, cat = found
+        if not check_category(cat, "Add image"):
+            return
+        files = usable_files(files)
+        if not files:
+            return
+        if cat == "video" and not HAS_FFMPEG:
+            pe("ffmpeg is required for video files. Install with: pkg install ffmpeg")
+            return
+
+        multi = len(files) > 1
+        ico_sizes = pick_ico_sizes(files)
+        if any(f.suffix.lower() == ".ico" for f in files) and \
+           any(f.suffix.lower() == ".ico" and f not in ico_sizes for f in files):
+            return  # an .ico couldn't be read; the error was already shown
+
+        # bitmap archives: the user decides how the images are laid out
+        frames_mode = False
+        if cat == "image" and multi:
+            choice = choose(f"Found {len(files)} images. How should they be added?", [
+                "All in this actor, one frame per image",
+                "Each as its own actor (forked from this one)",
+            ])
+            frames_mode = choice.startswith("All")
+        elif multi:
+            pb(f"Each of the {len(files)} {CATEGORY_LABELS[cat]} files will become its own actor.")
+
+        st = prompt_visual_settings(cat, files, multi)
+
+        fps = 4.0
+        if frames_mode:
+            while True:
+                raw = ask("Frames per second", default="4")
+                try:
+                    fps = float(raw)
+                    if fps > 0:
+                        break
+                except ValueError:
+                    pass
+                pe("Enter a number greater than 0.")
+
+        # sound: decide once, up front, for videos
+        want_audio = False
+        audio_files: set[Path] = set()
+        if cat == "video":
+            audio_files = {f for f in files if probe_has_audio(f)}
+            if audio_files:
+                p()
+                if len(files) == 1:
+                    msg = "This video has audio. Upload it and play it with the actor?"
+                else:
+                    msg = (f"{len(audio_files)} of {len(files)} videos have audio. "
+                           "Upload it and play it with each actor?")
+                want_audio = yn(msg, default="y")
+
+        base = copy.deepcopy(actor)
+        p()
+
+        if frames_mode:
             try:
-                pb("Extracting audio...")
-                extract_audio_mp3(img_path, audio_path)
-                pb("Uploading audio to Castle...")
-                uploaded = upload_audio_file(audio_path)
-                add_or_replace_audio_rule(actor, uploaded["url"])
-                ps(f"Audio added: {uploaded['url']}")
-            except Exception as e:
-                pe(f"Audio upload failed: {e}")
-                pw("Continuing with silent video.")
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                drawing2, summary = render_frames_actor(files, st, ico_sizes, fps)
+            except (Exception, SystemExit) as e:
+                pe(f"Could not import images: {e}")
+                return
+            actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+            ps(summary)
+            write_actor(bp_path, actor)
+            ps("Image added.")
+            maybe_delete_placeholder_script(card, bp_path)
+            return
 
-    with open(bp_path, "w", encoding="utf-8") as f:
-        json.dump(actor, f, indent=2)
-    ps("Image added.")
+        used_selected = False
+        added = 0
+        for f in files:
+            try:
+                drawing2, summary = render_visual(f, cat, st, ico_sizes.get(f))
+            except (Exception, SystemExit) as e:
+                pe(f"{f.name}: {e}")
+                continue
+            t_path, t_actor, is_selected = next_target(
+                card, bp_path, actor, base, used_selected, f.stem)
+            used_selected = True
+            if not is_selected:
+                strip_audio_rules(t_actor)
+            t_actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+            ps(summary)
+            if want_audio and f in audio_files:
+                if not attach_audio(t_actor, f, is_video=True):
+                    pw("Continuing with silent video.")
+            write_actor(t_path, t_actor)
+            if is_selected:
+                maybe_delete_placeholder_script(card, bp_path)
+            else:
+                ps(f"New actor created: {t_path.name}")
+            added += 1
 
-    maybe_delete_placeholder_script(card, bp_path)
+        if added:
+            ps("Image added." if added == 1 else f"{added} files added ({added - 1} new actor(s)).")
+        else:
+            pe("Nothing was added.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def do_add_audio(bp_path: Path, actor: dict, card: Path):
+    while True:
+        raw = ask_path("Enter the file path for your audio (or a .zip/.tar archive of them)")
+        src = resolve_path(raw)
+        if src.exists():
+            break
+        pe(f"File not found: {src}")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-media-"))
+    try:
+        found = gather_media(src, tmp_dir)
+        if not found:
+            return
+        files, cat = found
+        if not check_category(cat, "Add audio"):
+            return
+        if len(files) > 1:
+            pb(f"Each of the {len(files)} audio files will become its own actor.")
+
+        base = copy.deepcopy(actor)
+        used_selected = False
+        added = 0
+        p()
+        for f in files:
+            t_path, t_actor, is_selected = next_target(
+                card, bp_path, actor, base, used_selected, f.stem)
+            if not is_selected:
+                strip_audio_rules(t_actor)
+            if not attach_audio(t_actor, f, is_video=False):
+                continue
+            used_selected = True
+            write_actor(t_path, t_actor)
+            if not is_selected:
+                ps(f"New actor created: {t_path.name}")
+            added += 1
+
+        if added:
+            ps("Audio added." if added == 1 else f"{added} files added ({added - 1} new actor(s)).")
+        else:
+            pe("Nothing was added.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def do_add_midi(bp_path: Path, actor: dict, card: Path):
@@ -1850,123 +2337,182 @@ def do_add_midi(bp_path: Path, actor: dict, card: Path):
     ps("MIDI added.")
 
 
+def eot_to_sfnt(raw: bytes) -> bytes:
+    """Pull the TrueType/OpenType data out of an Embedded OpenType (.eot)
+    wrapper. Handles plain and XOR-obfuscated files; MTX-compressed ones
+    can't be unpacked here."""
+    if len(raw) < 82:
+        raise ValueError("file is too small to be an EOT font")
+    eot_size, font_size, _version, flags = struct.unpack_from("<IIII", raw, 0)
+    if flags & 0x4:
+        raise ValueError("this EOT uses MTX compression, which isn't supported "
+                         "(convert it to TTF or WOFF first)")
+    end = eot_size if 0 < eot_size <= len(raw) else len(raw)
+    if font_size <= 0 or font_size > end:
+        raise ValueError("EOT header is corrupt")
+    data = raw[end - font_size:end]
+    if flags & 0x10000000:
+        data = data.translate(bytes(b ^ 0x50 for b in range(256)))
+    return data
+
+
+def load_font(path: Path):
+    """Open .ttf/.otf/.woff directly, and .eot via its wrapper."""
+    if path.suffix.lower() == ".eot":
+        return TTFont(io.BytesIO(eot_to_sfnt(path.read_bytes())))
+    return TTFont(path)
+
+
 def do_add_font(bp_path: Path, actor: dict, card: Path):
     while True:
-        raw = ask_path("Enter the font file path (.ttf or .otf)")
-        font_path = resolve_path(raw)
-        if font_path.exists():
+        raw = ask_path("Enter the font file path (.ttf, .otf, .woff or .eot, or a .zip/.tar archive of them)")
+        src = resolve_path(raw)
+        if src.exists():
             break
-        pe(f"File not found: {font_path}")
+        pe(f"File not found: {src}")
 
-    p()
-    pb(f"Loading font: {font_path.name}")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-media-"))
     try:
-        font = TTFont(font_path)
-        cmap = font.getBestCmap()
-        glyph_set = font.getGlyphSet()
-        upm = font["head"].unitsPerEm
-    except Exception as e:
-        pe(f"Could not read font file: {e}")
-        return
-    if not cmap:
-        pe("This font has no usable character map (cmap).")
-        return
+        found = gather_media(src, tmp_dir)
+        if not found:
+            return
+        files, cat = found
+        if not check_category(cat, "Add Font"):
+            return
 
-    charset_names = list(FONT_CHARSETS.keys())
-    mode = choose("Select a mode:", [
-        "Basic (choose from preset unicode ranges)",
-        "Advanced (choose exact characters/codepoints)",
-    ])
+        p()
+        fonts = []
+        for fp in files:
+            pb(f"Loading font: {fp.name}")
+            try:
+                font = load_font(fp)
+                if not font.getBestCmap():
+                    pe(f"{fp.name}: this font has no usable character map (cmap).")
+                    continue
+                font.getGlyphSet()
+                font["head"].unitsPerEm
+            except Exception as e:
+                pe(f"Could not read font file {fp.name}: {e}")
+                continue
+            fonts.append((fp, font))
+        if not fonts:
+            return
+        if len(fonts) > 1:
+            pb(f"Each of the {len(fonts)} fonts will become its own actor "
+               "(same settings for all).")
 
-    codepoints: list[int] = []
-    label = ""
-    if mode.startswith("Basic"):
-        chosen_sets = multi_choose("Select one or more character sets:", charset_names)
-        cp_set: set[int] = set()
-        for name in chosen_sets:
-            cp_set.update(FONT_CHARSETS[name]())
-        codepoints = sorted(cp_set)
-        label = ", ".join(chosen_sets)
-    else:
-        source = choose("How would you like to provide characters?",
-                         ["Type them in", "Load from a file"])
-        if source == "Type them in":
-            text = ask_charspec(
-                "Enter characters and/or codepoints "
-                "(e.g. 0123456789ABCDEF U+03A9), separated by spaces:"
-            )
+        charset_names = list(FONT_CHARSETS.keys())
+        mode = choose("Select a mode:", [
+            "Basic (choose from preset unicode ranges)",
+            "Advanced (choose exact characters/codepoints)",
+        ])
+
+        codepoints: list[int] = []
+        label = ""
+        if mode.startswith("Basic"):
+            chosen_sets = multi_choose("Select one or more character sets:", charset_names)
+            cp_set: set[int] = set()
+            for name in chosen_sets:
+                cp_set.update(FONT_CHARSETS[name]())
+            codepoints = sorted(cp_set)
+            label = ", ".join(chosen_sets)
         else:
+            source = choose("How would you like to provide characters?",
+                             ["Type them in", "Load from a file"])
+            if source == "Type them in":
+                text = ask_charspec(
+                    "Enter characters and/or codepoints "
+                    "(e.g. 0123456789ABCDEF U+03A9), separated by spaces:"
+                )
+            else:
+                while True:
+                    raw = ask_path("Enter the path to your character/codepoint file")
+                    file_path = resolve_path(raw)
+                    if file_path.exists():
+                        break
+                    pe(f"File not found: {file_path}")
+                text = read_charspec_file(file_path)
+                print("  " + charspec_preview_ansi(text))
+                _tokens, _seen, valid = parse_charspec_tokens(text)
+                if not valid:
+                    pe("This file has duplicate or malformed characters/codepoints "
+                       "(highlighted above). Fix it and try again.")
+                    return
+            codepoints = charspec_codepoints(text)
+            label = "custom selection"
+
+        if not codepoints:
+            pe("No characters/codepoints were selected.")
+            return
+
+        p()
+        raw = ask("Scale multiplier (1.0 = ten Castle units per em)", default="1.0")
+        try:
+            scale = float(raw)
+            if scale <= 0:
+                raise ValueError
+        except ValueError:
+            pw("Invalid scale, using 1.0.")
+            scale = 1.0
+
+        steps = 16
+        if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
             while True:
-                raw = ask_path("Enter the path to your character/codepoint file")
-                file_path = resolve_path(raw)
-                if file_path.exists():
+                raw = ask("Steps per curve segment", default="16")
+                if raw.isdigit() and int(raw) >= 2:
+                    steps = int(raw)
                     break
-                pe(f"File not found: {file_path}")
-            text = read_charspec_file(file_path)
-            print("  " + charspec_preview_ansi(text))
-            _tokens, _seen, valid = parse_charspec_tokens(text)
-            if not valid:
-                pe("This file has duplicate or malformed characters/codepoints "
-                   "(highlighted above). Fix it and try again.")
-                return
-        codepoints = charspec_codepoints(text)
-        label = "custom selection"
+                pe("Enter a number ≥ 2")
 
-    if not codepoints:
-        pe("No characters/codepoints were selected.")
-        return
+        color = [0, 0, 0, 1]
+        if yn("Use a custom color instead of black?", default="n"):
+            color = ask_color("Enter glyph color")
 
-    p()
-    raw = ask("Scale multiplier (1.0 = ten Castle units per em)", default="1.0")
-    try:
-        scale = float(raw)
-        if scale <= 0:
-            raise ValueError
-    except ValueError:
-        pw("Invalid scale, using 1.0.")
-        scale = 1.0
+        base = copy.deepcopy(actor)
+        used_selected = False
+        added = 0
+        for fp, font in fonts:
+            cmap = font.getBestCmap()
+            glyph_set = font.getGlyphSet()
+            ppu = font["head"].unitsPerEm / 10.0  # 1 em = 10 Castle units before the user's scale multiplier
 
-    steps = 16
-    if yn("Customize bezier curve smoothness? (default 16 steps)", default="n"):
-        while True:
-            raw = ask("Steps per curve segment", default="16")
-            if raw.isdigit() and int(raw) >= 2:
-                steps = int(raw)
-                break
-            pe("Enter a number ≥ 2")
+            p()
+            pb(f"Rendering {len(codepoints)} glyph(s) from '{label}' ({fp.name})...")
+            glyph_frames = []
+            missing = 0
+            for cp in codepoints:
+                glyph_name = cmap.get(cp)
+                if not glyph_name or glyph_name not in glyph_set:
+                    missing += 1
+                    continue
+                d = font_glyph_svg_d(glyph_set, glyph_name)
+                path_data, bounds = font_glyph_to_path_data(d, steps, ppu, scale, color)
+                glyph_frames.append((cp, path_data, bounds))
 
-    ppu = upm / 10.0  # 1 em = 10 Castle units before the user's scale multiplier
-    color = [0, 0, 0, 1]
-    if yn("Use a custom color instead of black?", default="n"):
-        color = ask_color("Enter glyph color")
+            if not glyph_frames:
+                pe(f"None of the requested codepoints have a glyph in {fp.name}.")
+                continue
 
-    p()
-    pb(f"Rendering {len(codepoints)} glyph(s) from '{label}'...")
-    glyph_frames = []
-    missing = 0
-    for cp in codepoints:
-        glyph_name = cmap.get(cp)
-        if not glyph_name or glyph_name not in glyph_set:
-            missing += 1
-            continue
-        d = font_glyph_svg_d(glyph_set, glyph_name)
-        path_data, bounds = font_glyph_to_path_data(d, steps, ppu, scale, color)
-        glyph_frames.append((cp, path_data, bounds))
+            drawing2 = build_drawing2_font(glyph_frames, ppu, scale=10)
+            t_path, t_actor, is_selected = next_target(
+                card, bp_path, actor, base, used_selected, fp.stem)
+            used_selected = True
+            t_actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
+            write_actor(t_path, t_actor)
 
-    if not glyph_frames:
-        pe("None of the requested codepoints have a glyph in this font.")
-        return
+            if missing:
+                pw(f"{missing} requested codepoint(s) have no glyph in this font and were skipped.")
+            ps(f"Font added: {len(glyph_frames)} frame(s), one per glyph (frame order matches codepoint order).")
+            if is_selected:
+                maybe_delete_placeholder_script(card, bp_path)
+            else:
+                ps(f"New actor created: {t_path.name}")
+            added += 1
 
-    drawing2 = build_drawing2_font(glyph_frames, ppu, scale=10)
-    actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
-    with open(bp_path, "w", encoding="utf-8") as f:
-        json.dump(actor, f, indent=2)
-
-    if missing:
-        pw(f"{missing} requested codepoint(s) have no glyph in this font and were skipped.")
-    ps(f"Font added: {len(glyph_frames)} frame(s), one per glyph (frame order matches codepoint order).")
-
-    maybe_delete_placeholder_script(card, bp_path)
+        if not added:
+            pe("Nothing was added.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _env_flag(name: str) -> bool:
@@ -2025,6 +2571,8 @@ def do_upload_deck(deck: Path):
             print(f"   {line}")
     elif "memory access out of bounds" in combined:
         pe("Your file is too large!")
+    elif "you do not have permission to edit this deck" in combined:
+        pe("Permission denied, you likely deleted the deck on the app")
     else:
         pe("Save failed:")
         print(result.stdout)
@@ -2122,6 +2670,7 @@ def main():
         options = []
         if HAS_PIL:
             options.append("Add image")
+        options.append("Add audio")
         if HAS_MIDO:
             options.append("Add MIDI")
         if HAS_FONTTOOLS:
@@ -2135,6 +2684,8 @@ def main():
 
         if action == "Add image":
             do_add_image(bp_path, actor, card)
+        elif action == "Add audio":
+            do_add_audio(bp_path, actor, card)
         elif action == "Add MIDI":
             do_add_midi(bp_path, actor, card)
         elif action == "Add Font":

@@ -27,10 +27,35 @@ You may also use `castletool --cli` for the legacy interface.
 ## Capabilities
 
 - **Add image** — bitmap images, animated GIF/WEBP/APNG, video (with sound), and SVG are all supported.
+- **Add audio** — uploads a sound to Castle and plays it from the actor on create (looped), the same way a video's sound is added.
 - **Add MIDI** — converts a MIDI file into a Castle `Music` component.
 - **Add Font** — renders a font's characters as vectors.
 - **Edit Background Color** — sets the card's background color.
 - **Upload Deck** — runs `castle save-deck` on the current deck.
+
+## Supported file types
+
+| Purpose | Extensions |
+| --- | --- |
+| Images | png, jpg/jpeg, bmp, tif/tiff, ico, heic/heif, gif, webp, apng |
+| Video | mp4, mov, webm, avi, mkv, flv, m4v, 3gp, ogv |
+| Vector graphics | svg |
+| Audio | mp3, wav, ogg/oga, m4a, flac, aac |
+| Fonts | ttf, otf, woff, eot |
+
+- `.ico` files hold several resolutions; castletool asks which one to use.
+- `.heic`/`.heif` need the optional `pillow-heif` package (`pip install castletool[heif]`); castletool tries to install it the first time you use one.
+- Video, audio conversion and the sound of videos need `ffmpeg`. MTX-compressed `.eot` fonts aren't supported.
+- Anything else is rejected with a message. If you want a format added, [open an issue](https://github.com/MGoosePlayZ/castletool/issues).
+
+## Archives
+
+Anywhere castletool asks for a file you can give a `.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2` or `.tar.xz`/`.txz` instead. Subdirectories are searched and unsupported files inside are ignored.
+
+- All supported files in an archive must have the **same purpose** (all images, all videos, all audio, ...). Otherwise you get `Supported files are of different purpose`.
+- **Still images**: you choose between putting them all in the current actor as frames (in natural filename order), or making each its own actor.
+- **Animated images, videos, SVGs, audio and fonts**: each file automatically becomes its own actor. The first goes into the actor you selected; the rest are forked from it as new blueprints in the same card.
+- The same settings (scale, quantize, characters, ...) are used for every file in the archive.
 
 ## Add Font: Basic
 

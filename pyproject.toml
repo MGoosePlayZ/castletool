@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "castletool"
-version = "0.5.1"
-description = "Interactive Castle deck editor: inject images, animated GIF/WEBP/APNG, video with sound, SVG, MIDI music and vector-rendered fonts into Castle blueprints, set card backgrounds, and upload decks, via a tap/click TUI or a classic CLI."
+version = "0.5.5"
+description = "Interactive Castle deck editor: inject images, animated GIF/WEBP/APNG, video with sound, audio, SVG, MIDI music and vector-rendered fonts (from files or zip/tar archives) into Castle blueprints, set card backgrounds, and upload decks, via a tap/click TUI or a classic CLI."
 readme = "README.md"
 authors = [
     { name = "MGoosePlayZ" },
@@ -14,7 +14,7 @@ license = "Unlicense"
 license-files = ["LICENSE"]
 keywords = [
     "castle", "castle.xyz", "deck", "blueprint", "tui", "cli",
-    "gif", "svg", "midi", "font", "video", "image",
+    "gif", "svg", "midi", "font", "video", "image", "audio", "archive",
 ]
 requires-python = ">=3.10"
 classifiers = [
@@ -31,6 +31,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Graphics :: Graphics Conversion",
     "Topic :: Multimedia :: Sound/Audio :: MIDI",
+    "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Utilities",
 ]
 
@@ -41,6 +42,11 @@ dependencies = [
     "mido>=1.2.10",
     "fonttools>=4.0.0",
 ]
+
+[project.optional-dependencies]
+# HEIC/HEIF images. Optional because it can fail to build on some devices
+# (e.g. Termux); castletool also tries to install it on first use.
+heif = ["pillow-heif>=0.13.0"]
 
 [project.urls]
 Homepage = "https://pypi.org/project/castletool/"
