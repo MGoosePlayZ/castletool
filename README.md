@@ -53,7 +53,7 @@ You may also use `castletool --cli` for the legacy interface.
 Anywhere castletool asks for a file you can give a `.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2` or `.tar.xz`/`.txz` instead. Subdirectories are searched and unsupported files inside are ignored.
 
 - All supported files in an archive must have the **same purpose** (all images, all videos, all audio, ...). Otherwise you get `Supported files are of different purpose`.
-- **Still images**: you choose between putting them all in the current actor as frames (in natural filename order), or making each its own actor. You also choose how sizes are handled:
+- **Still images and SVGs**: you choose between putting them all in the current actor as frames (in natural filename order), or making each its own actor. You also choose how sizes are handled:
   - *Scale images to fit* keeps all images the same size.
   - *Don't scale images* keeps 1 pixel = 1 pixel no matter what (every image shares one pixel density, so bigger images appear bigger). Best for pixel art or small images where accuracy matters.
 - **Animated images, videos, SVGs, audio and fonts**: each file automatically becomes its own actor. The first goes into the actor you selected; the rest are forked from it as new blueprints in the same card.
@@ -61,7 +61,7 @@ Anywhere castletool asks for a file you can give a `.zip`, `.tar`, `.tar.gz`/`.t
 
 ## Bitmap SVGs and fonts
 
-- **SVG** — choose *Vector* (line segments, the default) or *Bitmap* (filled in, keeps its colors; even-odd fill, so holes work). Not supported: gradients, transforms, `<style>` blocks/classes.
+- **SVG** — in an archive, SVGs can also go in one actor as frames (vector or bitmap). Choose *Vector* (line segments, the default) or *Bitmap* (filled in, keeps its colors; even-odd fill, so holes work). Not supported: gradients, transforms, `<style>` blocks/classes.
 - **Font** — choose *Vector* (outlines) or *Bitmap* (one filled image per glyph, drawn with FreeType at a pixel size you choose). Glyphs share one canvas and baseline so frames don't jump.
 - **Colors** — an SVG's own colors (attributes, inline `style`, inherited from groups) are used by default. If a shape doesn't specify one, you pick a color for those shapes. Fonts always ask you to pick a color.
 - **Bilinear interpolation** — off by default (crisp nearest-neighbor pixels). Turn it on for smooth scaling of images and video, and for anti-aliased edges on bitmap SVGs and fonts.

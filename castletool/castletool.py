@@ -1535,33 +1535,36 @@ def svg_to_path_data(svg_path, steps: int = 16, scale: float = 1.0,
     return path_data, bounds, fill_bounds
 
 
-def build_drawing2_vector(path_data, bounds, fill_bounds,
-                           scale=10, ppu=SVG_DEFAULT_PPU) -> dict:
-    frame = {
+def build_drawing2_vector_frames(items, fps: float = 4, play_mode: str = "still",
+                                 scale=10, ppu=SVG_DEFAULT_PPU) -> dict:
+    """items: [(path_data, bounds, fill_bounds), ...] → one Drawing2 with one
+    vector frame per item."""
+    frames = [{
         "isLinked": False,
         "pathDataList": path_data,
         "fillImageBounds": fill_bounds,
         "avatarX": 0, "avatarY": 0, "avatarRadius": 5,
-    }
+    } for path_data, _bounds, fill_bounds in items]
+    hash_src = str(items[0][0]) if len(items) == 1 else str([it[0] for it in items])
     return {
         "initialFrame": 1, "currentFrame": 1,
-        "framesPerSecond": 4,
-        "playMode": "still",
+        "framesPerSecond": fps,
+        "playMode": play_mode,
         "loopStartFrame": -1, "loopEndFrame": -1,
         "opacity": 1,
-        "hash": str(abs(hash(str(path_data))))[:19],
-        "playing": False, "loop": False,
+        "hash": str(abs(hash(hash_src)))[:19],
+        "playing": False, "loop": play_mode != "still",
         "drawData": {
             "color": [1,1,1,1], "lineColor": [0,0,0,1],
             "gridSize": 0.71428, "scale": scale, "version": 3,
             "fillPixelsPerUnit": ppu,
             "numTotalLayers": 1,
-            "framesBounds": [bounds],
+            "framesBounds": [it[1] for it in items],
             "colors": [], "selectedFrame": 1,
             "layers": [{
                 "title": "Layer 1", "id": "layer1",
                 "isVisible": True, "isBitmap": False, "isAvatar": False,
-                "frames": [frame],
+                "frames": frames,
             }],
         },
         "physicsBodyData": {
@@ -1574,6 +1577,12 @@ def build_drawing2_vector(path_data, bounds, fill_bounds,
         },
         "disabled": False,
     }
+
+
+def build_drawing2_vector(path_data, bounds, fill_bounds,
+                           scale=10, ppu=SVG_DEFAULT_PPU) -> dict:
+    return build_drawing2_vector_frames([(path_data, bounds, fill_bounds)],
+                                        scale=scale, ppu=ppu)
 
 
 # ── font → Drawing2 (one actor, one frame per glyph) ─────────────────────────
@@ -2292,16 +2301,25 @@ def _ask_scale(prompt: str, default: str = "1") -> float:
         return 1.0
 
 
+def _ask_size_handling() -> bool:
+    """Still-image/bitmap-SVG archives: True = "don't scale" (1 pixel = 1 pixel)."""
+    choice = choose("How should image sizes be handled?", [
+        "Scale images to fit (keeps all images the same size)",
+        "Don't scale images (1 pixel = 1 pixel, best for pixel art)",
+    ])
+    return choice.startswith("Don't")
+
+
 def prompt_visual_settings(cat: str, files: list[Path], multi: bool,
-                           no_scale: bool = False, resizes: bool = False) -> dict:
+                           frames_mode: bool = False) -> dict:
     """Ask the processing questions once; they apply to every file.
-    no_scale: still-image archive set to "don't scale" (1 pixel = 1 pixel).
-    resizes: images get resized even at scale 1 (archive frames fitted to the
-    first image), so the interpolation question is still relevant."""
+    frames_mode: the files become frames of one actor (so they get resized to
+    match unless "don't scale" is chosen, which keeps interpolation relevant)."""
+    no_scale = False
     st = {"scale": 1.0, "every": 1, "quantize": 0,
           "svg_scale": 1.0, "steps": 16, "color": None,
           "smooth": False, "bitmap": False, "fallback_color": None,
-          "no_scale": no_scale, "fixed_scale": None}
+          "no_scale": False, "fixed_scale": None}
     note = " (applies to every file)" if multi else ""
     p()
 
@@ -2312,6 +2330,8 @@ def prompt_visual_settings(cat: str, files: list[Path], multi: bool,
         ])
         st["bitmap"] = style.startswith("Bitmap")
         if st["bitmap"]:
+            if multi:
+                no_scale = _ask_size_handling()
             st["scale"] = _ask_scale("Scale (1 = the SVG's own size in pixels, 2 = double)")
             st["smooth"] = yn(SMOOTH_PROMPT, default="n")
         else:
@@ -2338,12 +2358,16 @@ def prompt_visual_settings(cat: str, files: list[Path], multi: bool,
             st["fallback_color"] = ask_color("Pick a color for them")
         if not st["bitmap"]:
             return st
-    elif no_scale:
-        p("Images keep their original size (1 pixel = 1 pixel).")
     else:
-        st["scale"] = _ask_scale("Scale (1 = full resolution, 0.5 = half, 2 = double)" + note)
-        if st["scale"] != 1.0 or resizes:
-            st["smooth"] = yn(SMOOTH_PROMPT, default="n")
+        if cat == "image" and multi:
+            no_scale = _ask_size_handling()
+        if no_scale:
+            p("Images keep their original size (1 pixel = 1 pixel).")
+        else:
+            st["scale"] = _ask_scale("Scale (1 = full resolution, 0.5 = half, 2 = double)" + note)
+            if st["scale"] != 1.0 or frames_mode:
+                st["smooth"] = yn(SMOOTH_PROMPT, default="n")
+    st["no_scale"] = no_scale
 
     if cat in ("animation", "video"):
         p()
@@ -2384,13 +2408,19 @@ def scaled_size(native: tuple[int, int], scale: float) -> tuple[int, int]:
     return max(1, round(native[0] * scale)), max(1, round(native[1] * scale))
 
 
-def fixed_density_scale(files: list[Path], ico_sizes: dict) -> int | None:
+def fixed_density_scale(files: list[Path], ico_sizes: dict,
+                        cat: str = "image", svg_scale: float = 1.0) -> int | None:
     """One pixels-per-unit for a whole batch, sized so the LARGEST image looks
-    as it normally would. Every image then shares the same pixel size."""
+    as it normally would. Every image then shares the same pixel size.
+    (Bitmap SVGs: their rasterized size at `svg_scale`.)"""
     dims = []
     for f in files:
         try:
-            dims.append(visual_native_size(f, "image", ico_sizes.get(f)))
+            if cat == "vector":
+                _x, _y, vw, vh = _svg_dims(ET.parse(f).getroot())
+                dims.append(scaled_size((vw, vh), svg_scale))
+            else:
+                dims.append(visual_native_size(f, "image", ico_sizes.get(f)))
         except Exception:
             pass
     if not dims:
@@ -2409,7 +2439,8 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
         if st["quantize"]:
             pb(f"Quantizing to {st['quantize']} colors...")
             frames = [quantize_frame(f, st["quantize"]) for f in frames]
-        drawing2 = build_drawing2(frames, 1.0, width, height, "still")
+        drawing2 = build_drawing2(frames, 1.0, width, height, "still",
+                                  scale=st["fixed_scale"])
         return drawing2, f"SVG ready: bitmap, {width}×{height}px"
 
     if cat == "vector":
@@ -2476,6 +2507,51 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
     return drawing2, f"Image ready: {len(frames)} frame(s), {fps} FPS, {size_note}"
 
 
+def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
+    """Several SVGs → ONE Drawing2 with one frame per SVG. Returns
+    (drawing2, summary). Bitmap SVGs follow the same fit / don't-scale rules
+    as still images."""
+    if not st["bitmap"]:
+        items = []
+        for f in files:
+            pb(f"Loading SVG: {f.name}")
+            items.append(svg_to_path_data(f, steps=st["steps"], scale=st["svg_scale"],
+                                          color=st["color"], fallback_color=st["fallback_color"]))
+        play_mode = "loop" if len(items) > 1 else "still"
+        drawing2 = build_drawing2_vector_frames(items, fps=fps, play_mode=play_mode)
+        return drawing2, f"SVG ready: {len(items)} frame(s), {fps} FPS"
+
+    rendered = []   # (png, w, h)
+    for f in files:
+        pb(f"Rasterizing SVG: {f.name}")
+        rendered.append(rasterize_svg(f, scale=st["scale"], smooth=st["smooth"],
+                                      color=st["color"], fallback_color=st["fallback_color"]))
+    if st["no_scale"]:
+        frames = [r[0] for r in rendered]
+        sizes = [(r[1], r[2]) for r in rendered]
+        width, height = max(s[0] for s in sizes), max(s[1] for s in sizes)
+    else:
+        width, height = rendered[0][1], rendered[0][2]
+        resample = Image.BILINEAR if st["smooth"] else Image.NEAREST
+        frames = []
+        for png, w, h in rendered:
+            if (w, h) != (width, height):
+                im = Image.open(io.BytesIO(png)).convert("RGBA").resize((width, height), resample)
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                png = buf.getvalue()
+            frames.append(png)
+        sizes = None
+    if st["quantize"]:
+        pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
+        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+    play_mode = "loop" if len(frames) > 1 else "still"
+    drawing2 = build_drawing2(frames, fps, width, height, play_mode,
+                              sizes=sizes, scale=st["fixed_scale"])
+    size_note = "sizes kept" if st["no_scale"] else f"{width}×{height}px"
+    return drawing2, f"SVG ready: bitmap, {len(frames)} frame(s), {fps} FPS, {size_note}"
+
+
 def do_add_image(bp_path: Path, actor: dict, card: Path):
     while True:
         raw = ask_path("Enter the file path for your image/video (or a .zip/.tar archive of them)")
@@ -2505,30 +2581,21 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
            any(f.suffix.lower() == ".ico" and f not in ico_sizes for f in files):
             return  # an .ico couldn't be read; the error was already shown
 
-        # bitmap archives: the user decides how the images are laid out
+        # still images / SVGs: the user decides how an archive is laid out
         frames_mode = False
-        if cat == "image" and multi:
-            choice = choose(f"Found {len(files)} images. How should they be added?", [
-                "All in this actor, one frame per image",
+        if cat in ("image", "vector") and multi:
+            noun = "image" if cat == "image" else "SVG"
+            choice = choose(f"Found {len(files)} {noun}s. How should they be added?", [
+                f"All in this actor, one frame per {noun}",
                 "Each as its own actor (forked from this one)",
             ])
             frames_mode = choice.startswith("All")
         elif multi:
             pb(f"Each of the {len(files)} {CATEGORY_LABELS[cat]} files will become its own actor.")
 
-        # still-image archives: keep one size, or keep every image's pixels as-is
-        no_scale = False
-        if cat == "image" and multi:
-            size_choice = choose("How should image sizes be handled?", [
-                "Scale images to fit (keeps all images the same size)",
-                "Don't scale images (1 pixel = 1 pixel, best for pixel art)",
-            ])
-            no_scale = size_choice.startswith("Don't")
-
-        st = prompt_visual_settings(cat, files, multi, no_scale=no_scale,
-                                    resizes=(frames_mode and not no_scale))
-        if no_scale:
-            st["fixed_scale"] = fixed_density_scale(files, ico_sizes)
+        st = prompt_visual_settings(cat, files, multi, frames_mode=frames_mode)
+        if st["no_scale"]:
+            st["fixed_scale"] = fixed_density_scale(files, ico_sizes, cat, st["scale"])
 
         fps = 4.0
         if frames_mode:
@@ -2561,9 +2628,12 @@ def do_add_image(bp_path: Path, actor: dict, card: Path):
 
         if frames_mode:
             try:
-                drawing2, summary = render_frames_actor(files, st, ico_sizes, fps)
+                if cat == "vector":
+                    drawing2, summary = render_svg_frames_actor(files, st, fps)
+                else:
+                    drawing2, summary = render_frames_actor(files, st, ico_sizes, fps)
             except (Exception, SystemExit) as e:
-                pe(f"Could not import images: {e}")
+                pe(f"Could not import {'SVGs' if cat == 'vector' else 'images'}: {e}")
                 return
             actor["actorBlueprint"]["components"]["Drawing2"] = drawing2
             ps(summary)
