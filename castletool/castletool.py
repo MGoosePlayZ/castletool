@@ -2088,6 +2088,9 @@ def gather_media(path: Path, tmp_dir: Path):
     """Turn what the user pointed at (a file or an archive) into
     (files, category). Prints the reason and returns None if nothing usable."""
     if not is_archive(path):
+        if path.stat().st_size == 0:
+            pe(f"{path.name} is empty (0 bytes).")
+            return None
         cat = classify_file(path)
         if cat is None:
             report_unsupported(path)
@@ -2106,12 +2109,18 @@ def gather_media(path: Path, tmp_dir: Path):
 
     by_cat: dict[str, list[Path]] = {}
     ignored = 0
+    empty = 0
     for f in files:
+        if f.stat().st_size == 0:   # some icon sets ship empty placeholder files
+            empty += 1
+            continue
         cat = classify_file(f)
         if cat is None:
             ignored += 1
         else:
             by_cat.setdefault(cat, []).append(f)
+    if empty:
+        pw(f"Ignored {empty} empty file(s) in the archive.")
     if ignored:
         pw(f"Ignored {ignored} unsupported file(s) in the archive.")
     if not by_cat:
@@ -2481,20 +2490,33 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
     if st["no_scale"]:
         for f in files:
             pb(f"Loading image: {f.name}")
-            w, h = visual_native_size(f, "image", ico_sizes.get(f))
-            got, _ = load_image_frames(f, w, h, ico_size=ico_sizes.get(f))
+            try:
+                w, h = visual_native_size(f, "image", ico_sizes.get(f))
+                got, _ = load_image_frames(f, w, h, ico_size=ico_sizes.get(f))
+            except Exception as e:
+                pw(f"Skipping {f.name}: {e}")
+                continue
             frames.extend(got)
             sizes.extend([(w, h)] * len(got))
+        if not frames:
+            raise ValueError("none of the images could be read")
         width, height = max(s[0] for s in sizes), max(s[1] for s in sizes)
     else:
-        first = files[0]
-        width, height = scaled_size(
-            visual_native_size(first, "image", ico_sizes.get(first)), st["scale"])
+        width = height = None
         for f in files:
             pb(f"Loading image: {f.name}")
-            got, _ = load_image_frames(f, width, height, ico_size=ico_sizes.get(f),
-                                       smooth=st["smooth"])
+            try:
+                if width is None:   # sized like the first image that loads
+                    width, height = scaled_size(
+                        visual_native_size(f, "image", ico_sizes.get(f)), st["scale"])
+                got, _ = load_image_frames(f, width, height, ico_size=ico_sizes.get(f),
+                                           smooth=st["smooth"])
+            except Exception as e:
+                pw(f"Skipping {f.name}: {e}")
+                continue
             frames.extend(got)
+        if not frames:
+            raise ValueError("none of the images could be read")
         sizes = None
 
     if st["quantize"]:
@@ -2515,8 +2537,13 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
         items = []
         for f in files:
             pb(f"Loading SVG: {f.name}")
-            items.append(svg_to_path_data(f, steps=st["steps"], scale=st["svg_scale"],
-                                          color=st["color"], fallback_color=st["fallback_color"]))
+            try:
+                items.append(svg_to_path_data(f, steps=st["steps"], scale=st["svg_scale"],
+                                              color=st["color"], fallback_color=st["fallback_color"]))
+            except Exception as e:
+                pw(f"Skipping {f.name}: {e}")
+        if not items:
+            raise ValueError("none of the SVGs could be read")
         play_mode = "loop" if len(items) > 1 else "still"
         drawing2 = build_drawing2_vector_frames(items, fps=fps, play_mode=play_mode)
         return drawing2, f"SVG ready: {len(items)} frame(s), {fps} FPS"
@@ -2524,8 +2551,13 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
     rendered = []   # (png, w, h)
     for f in files:
         pb(f"Rasterizing SVG: {f.name}")
-        rendered.append(rasterize_svg(f, scale=st["scale"], smooth=st["smooth"],
-                                      color=st["color"], fallback_color=st["fallback_color"]))
+        try:
+            rendered.append(rasterize_svg(f, scale=st["scale"], smooth=st["smooth"],
+                                          color=st["color"], fallback_color=st["fallback_color"]))
+        except Exception as e:
+            pw(f"Skipping {f.name}: {e}")
+    if not rendered:
+        raise ValueError("none of the SVGs could be read")
     if st["no_scale"]:
         frames = [r[0] for r in rendered]
         sizes = [(r[1], r[2]) for r in rendered]
