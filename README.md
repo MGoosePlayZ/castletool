@@ -28,7 +28,7 @@ You may also use `castletool --cli` for the legacy interface.
 
 - **Add image** — bitmap images, animated GIF/WEBP/APNG, video (with sound), and SVG are all supported. SVGs can be drawn as vector line segments or as a filled bitmap.
 - **Add audio** — uploads a sound to Castle and plays it from the actor on create (looped), the same way a video's sound is added. Castle limits sounds to 30 seconds, so longer audio (and longer video soundtracks) is split into parts just under 30s, uploaded one by one, and chained to play back to back.
-- **Add MIDI** — converts a MIDI file into a Castle `Music` component.
+- **Add MIDI** — converts a MIDI file into a Castle `Music` component. Percussion (GM channel 10) becomes a Castle `drums` track: kick, low tom, high tom, snare, clap, hat and open hat (keys 36-42); other GM percussion is folded onto the nearest of those, or dropped if there's no match.
 - **Add Font** — renders a font's characters as vector outlines or as filled bitmap glyphs.
 - **Edit Background Color** — sets the card's background color.
 - **Upload Deck** — runs `castle save-deck` on the current deck.
