@@ -27,7 +27,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.7.0"
+CURRENT_VERSION = "0.7.1"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
